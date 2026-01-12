@@ -1,6 +1,6 @@
 # Beads Integration
 
-Optional issue tracking integration for skills that execute in projects with beads initialized.
+**ENFORCED**: Issue tracking integration for skills that execute in projects with beads initialized.
 
 ## Purpose
 
@@ -12,13 +12,17 @@ Beads (bd) provides **persistent cross-session issue tracking** for:
 
 ## When Skills Use Beads
 
-Skills check for beads availability using `is_beads_available()` and gracefully fall back to TodoWrite when unavailable:
+**Planner skill:** Beads integration is **ENFORCED**. Planner checks for beads availability and:
+- If available: **MUST** create milestone issues and track progress
+- If unavailable: **MUST** prompt user to run `bd init` before proceeding with plan approval
+
+**Other skills:** Beads integration is **OPTIONAL**. Skills check for beads availability using `is_beads_available()` and gracefully fall back to TodoWrite when unavailable:
 
 ```python
 from skills.lib.beads import is_beads_available
 
 if is_beads_available():
-    # Optional beads tracking
+    # Optional beads tracking for non-planner skills
     create_issue(title="Feature X", issue_type="feature")
 else:
     # Fallback to TodoWrite for in-session tracking
@@ -29,21 +33,22 @@ else:
 ### Planner Skill
 
 **Planning phase (step 5):**
-- After writing plan, suggests creating feature issue
-- Suggests creating milestone issues for each milestone
-- Linking milestone dependencies via `bd dep`
+- After writing plan, **MUST** create milestone issues for each milestone
+- **MUST** link milestone dependencies via `bd dep`
+- **MAY** create parent feature issue (optional)
 
 **Execution phase (step 1):**
-- Checks for existing feature/milestone issues
-- Notes milestone IDs for status tracking
+- **MUST** check for existing milestone issues
+- **MUST** note milestone IDs for status tracking
 
 **Execution phase (step 3):**
-- Optionally updates milestone status to `in_progress` when starting
-- Optionally closes milestone issues when complete
+- **MUST** update milestone status to `in_progress` when starting
+- **MUST** close milestone issues when complete
 
 **Execution phase (step 9 - retrospective):**
-- Suggests closing parent feature issue if all milestones done
-- Shows `bd ready` for remaining work
+- **MUST** verify all milestone issues are closed
+- **MUST** show `bd ready` for remaining work
+- **MAY** close parent feature issue if all milestones done (optional)
 
 ### Refactor Skill
 
@@ -117,37 +122,39 @@ bd blocked                # Show blocked issues
 bd dep APP-003 APP-002    # APP-003 depends on APP-002
 ```
 
-## Graceful Degradation
+## Enforcement Policy
 
-All beads integration is **optional**. Skills work identically when beads is not available:
+Beads integration is **ENFORCED** for planner skill in projects with `.beads/` directory:
 
 1. **Detection**: `is_beads_available()` returns `False` if `bd list` fails
-2. **Fallback**: Skills use TodoWrite for in-session tracking
-3. **No errors**: No error messages if beads unavailable
-4. **User choice**: Skills suggest but don't require beads usage
+2. **Requirement**: Planner skill **MUST** create and track milestone issues when beads is available
+3. **Fallback**: If beads is not initialized, planner skill **MUST** prompt user to initialize with `bd init`
+4. **Error handling**: Planner should not proceed with plan approval until milestone issues are created
 
-This allows the config to work across:
-- Projects with beads initialized
-- Projects using external issue tracking (JIRA, GitHub Issues)
-- Projects with no issue tracking
-- Quick one-off tasks
+For non-planner skills and projects without beads:
+- Skills gracefully fall back to TodoWrite for in-session tracking
+- No errors if beads unavailable
+- Beads remains optional for quick one-off tasks and external issue trackers
 
 ## Design Rationale
 
-**Why optional?** Not all projects benefit from beads:
-- Simple scripts or prototypes
-- Projects with existing issue trackers
-- One-session features
+**Why enforced for planner?** Planning creates cross-session work:
+- Plans are meant to persist after `/clear`
+- Milestones have dependencies requiring tracking
+- Multi-session execution benefits from issue persistence
+- Without tracking, planned work gets lost across sessions
 
-**Why suggest, not require?** Users should control tracking:
-- Some prefer external tools
-- Some find issue tracking overhead unnecessary
-- Skills shouldn't force workflow changes
+**Why optional for other skills?** Not all work needs persistent tracking:
+- Simple scripts or prototypes
+- Projects with existing issue trackers (JIRA, GitHub Issues)
+- One-session features and quick fixes
+- Analysis/refactor findings (future enhancement)
 
 **Why per-project init?** Each project has unique needs:
-- Different prefix conventions
+- Different prefix conventions (APP-, FEAT-, BUG-)
 - Different tracking granularity
 - Some projects share trackers
+- User controls when to enable beads per project
 
 ## Library API
 
