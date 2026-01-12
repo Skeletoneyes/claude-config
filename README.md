@@ -334,3 +334,81 @@ For targeted updates:
 ```
 Use your doc-sync skill to update documentation in src/validators/
 ```
+
+## Beads Integration
+
+This workflow includes optional integration with beads (bd), a git-backed issue tracker for persistent cross-session work tracking.
+
+### Why Beads?
+
+LLM conversations get cleared. Context resets. TodoWrite tasks vanish when you `/clear`. Beads solves this by providing issue tracking that survives across sessions.
+
+Without beads, planning a feature in one session and executing it after `/clear` means reconstructing all context from the plan file. With beads:
+
+- Feature and milestone issues persist across sessions
+- Dependencies between milestones are explicit
+- Progress tracking survives conversation resets
+- Technical debt from analysis can be queued for later
+
+### How It Works
+
+Beads is **optional and per-project**. Skills detect whether beads is initialized in the current working directory and gracefully fall back to TodoWrite when unavailable.
+
+```bash
+# Initialize in your project (not in the config directory)
+cd ~/projects/my-app
+bd init --prefix APP  # Creates .beads/ with APP-001, APP-002, etc.
+```
+
+The planner skill uses beads automatically when available:
+
+- **Planning phase**: Suggests creating a feature issue and milestone issues with dependencies
+- **Execution phase**: Tracks milestone status (in_progress → closed)
+- **Retrospective**: Shows remaining work via `bd ready`
+
+### Beads vs TodoWrite
+
+| Aspect | Beads | TodoWrite |
+|--------|-------|-----------|
+| Lifetime | Persistent across sessions | Single conversation |
+| Survives /clear | ✅ Yes | ❌ No |
+| Git-backed | ✅ Yes | ❌ No |
+| Dependencies | ✅ Yes | ❌ No |
+| Use case | Cross-session tracking | In-session tasks |
+
+**Hybrid strategy recommended:**
+
+- **Beads**: Feature planning, milestone tracking, technical debt, architecture gaps
+- **TodoWrite**: Debug cleanup, QR fix iterations, current wave tracking, sub-task breakdown
+
+### Common Commands
+
+```bash
+# Create issues
+bd create --type feature --title "Add async logging" --priority 1
+bd create --type task --title "M0: Configure NLog" --deps APP-001
+
+# Update status
+bd update APP-002 --status in_progress
+bd close APP-002 "Milestone complete"
+
+# Check work
+bd ready                  # Show tasks with no blockers
+bd list --status open     # Show all open issues
+bd blocked                # Show blocked issues
+
+# Dependencies
+bd dep APP-003 APP-002    # APP-003 depends on APP-002
+```
+
+### Graceful Degradation
+
+All beads integration is optional. Skills work identically when beads is not available. No error messages if unavailable. Skills suggest but don't require beads usage.
+
+This allows the workflow to work across:
+- Projects with beads initialized
+- Projects using external issue tracking (JIRA, GitHub Issues)
+- Projects with no issue tracking
+- Quick one-off tasks
+
+For full details, see conventions/beads-integration.md
