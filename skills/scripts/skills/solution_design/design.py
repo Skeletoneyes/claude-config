@@ -20,12 +20,17 @@ identify problems or perform root cause analysis--that belongs upstream
 
 import argparse
 import sys
+from typing import Annotated
 
-from skills.lib.workflow.formatters import (
-    format_step_header,
-    format_xml_mandate,
-    format_current_action,
+from skills.lib.workflow.core import (
+    Workflow,
+    StepDef,
+    StepContext,
+    Outcome,
+    Arg,
 )
+from skills.lib.workflow.ast import W, XMLRenderer, render, TextNode, ElementNode
+from skills.lib.workflow.types import FlatCommand
 from skills.solution_design.perspectives import PERSPECTIVES, PERSPECTIVE_ORDER
 from skills.solution_design.defaults import format_all_defaults
 
@@ -35,9 +40,6 @@ MODULE_PATH = "skills.solution_design.design"
 PERSPECTIVE_MODULE_PATH = "skills.solution_design.perspective"
 
 
-def format_invoke_after(command: str) -> str:
-    """Render invoke after block for design workflow."""
-    return f"<invoke_after>\n{command}\n</invoke_after>"
 
 
 # =============================================================================
@@ -55,6 +57,44 @@ PERSPECTIVE_SUMMARIES = [
 ]
 
 
+AGENT_PROMPT_TEMPLATE = """Generate solutions for this root cause from the $PERSPECTIVE perspective.
+
+ROOT CAUSE: [include verbatim from Step 1]
+HARD CONSTRAINTS: [include from Step 1]
+
+EVALUATION CRITERIA (from Step 3 - FINALIZED_CRITERIA):
+These criteria will be used to evaluate your solutions. Use them to:
+- Avoid proposing solutions with obviously fatal flaws
+- Flag risks that match significant/minor conditions
+- Be explicit about trade-offs on the weighted dimensions
+
+VIABILITY:
+  [Include viability criteria from FINALIZED_CRITERIA]
+  A solution must meet ALL these criteria to be considered viable.
+
+FLAW SEVERITY:
+  FATAL (solution will be eliminated):
+    [List fatal conditions from FINALIZED_CRITERIA]
+
+  SIGNIFICANT (solution viable but with documented issues):
+    [List significant conditions from FINALIZED_CRITERIA]
+
+  MINOR (noted as trade-off):
+    [List minor conditions from FINALIZED_CRITERIA]
+
+TRADEOFF DIMENSIONS:
+  PRIMARY (weighted in ranking):
+    [List primary dimensions with weights from FINALIZED_CRITERIA]
+
+  When describing trade-offs, address these dimensions explicitly.
+
+GUIDANCE:
+- Still explore your perspective FULLY--do not only generate 'safe' solutions
+- If your perspective suggests something that might hit a fatal condition,
+  either explain why it doesn't, or note the risk explicitly
+- Be specific about how your solutions perform on the primary trade-off dimensions"""
+
+
 # =============================================================================
 # XML Formatters (design-specific)
 # =============================================================================
@@ -62,88 +102,75 @@ PERSPECTIVE_SUMMARIES = [
 
 def format_perspective_selection_guidance() -> str:
     """Format guidance for launching all perspectives."""
-    lines = ['<perspective_dispatch>']
-    lines.append("  Launch ALL perspectives in parallel.")
-    lines.append("  Each perspective reasons differently; synthesis handles deduplication.")
-    lines.append("</perspective_dispatch>")
-    return "\n".join(lines)
+    return render(
+        W.el("perspective_dispatch",
+            TextNode("Launch ALL perspectives in parallel."),
+            TextNode("Each perspective reasons differently; synthesis handles deduplication.")
+        ).build(),
+        XMLRenderer()
+    )
 
 
-def format_parallel_dispatch() -> str:
-    """Format the parallel dispatch block for step 4."""
-    lines = ['<parallel_dispatch agent="general-purpose">']
+def build_perspective_dispatch() -> str:
+    """Build parallel dispatch block for perspective agents."""
+    agents = [
+        {"id": p_id, "title": p_title, "task": p_question}
+        for p_id, p_title, p_question in PERSPECTIVE_SUMMARIES
+    ]
+    model_per_agent = {"minimal": "HAIKU", "firstprinciples": "OPUS"}
+    invoke_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {PERSPECTIVE_MODULE_PATH} --step 1 --total-steps 2 --perspective $PERSPECTIVE_ID" />'
+
+    lines = [f'<parallel_dispatch agent="general-purpose" count="{len(agents)}">']
+
     lines.append("  <mandatory>")
     lines.append("    You MUST launch EXACTLY 7 sub-agents in a SINGLE message.")
-    lines.append("    One agent for each perspective listed below. No selection. No filtering.")
-    lines.append("    If you launch fewer than 7 agents, you have failed this step.")
+    lines.append("    If you launch fewer agents, you have failed this step.")
     lines.append("  </mandatory>")
     lines.append("")
+
+    lines.append("  <instruction>")
+    instruction = "Launch ALL perspective agents listed below.\nOne agent for each perspective. No selection. No filtering."
+    for line in instruction.split("\n"):
+        lines.append(f"    {line}" if line else "")
+    lines.append("  </instruction>")
+    lines.append("")
+
+    lines.append("  <model_selection>")
+    lines.append("    Use SONNET (default) for all agents.")
+    lines.append("    Per-agent overrides:")
+    for agent_id, agent_model in model_per_agent.items():
+        lines.append(f"      - {agent_model}: {agent_id}")
+    lines.append("  </model_selection>")
+    lines.append("")
+
     lines.append("  <agents_to_launch>")
-    for p_id, p_title, p_question in PERSPECTIVE_SUMMARIES:
-        lines.append(f'    <agent perspective="{p_id}">')
-        lines.append(f'      {p_title}: {p_question}')
+    for a in agents:
+        agent_id = a.get("id", "")
+        lines.append(f'    <agent perspective="{agent_id}">')
+        if "title" in a:
+            lines.append(f"      {a['title']}: {a.get('task', '')}")
+        elif "task" in a:
+            lines.append(f"      {a['task']}")
         lines.append("    </agent>")
     lines.append("  </agents_to_launch>")
     lines.append("")
-    lines.append("  <model_selection>")
-    lines.append("    If user requested a specific model, use that for ALL agents.")
-    lines.append("    Otherwise, default by perspective:")
-    lines.append("      - HAIKU: minimal")
-    lines.append("      - SONNET: structural, domain, stateless, removal, upstream")
-    lines.append("      - OPUS: firstprinciples")
-    lines.append("  </model_selection>")
-    lines.append("")
+
     lines.append("  <agent_prompt_template>")
-    lines.append("    Generate solutions for this root cause from the $PERSPECTIVE perspective.")
+    for line in AGENT_PROMPT_TEMPLATE.split("\n"):
+        lines.append(f"    {line}" if line else "")
     lines.append("")
-    lines.append("    ROOT CAUSE: [include verbatim from Step 1]")
-    lines.append("    HARD CONSTRAINTS: [include from Step 1]")
-    lines.append("")
-    lines.append("    EVALUATION CRITERIA (from Step 3 - FINALIZED_CRITERIA):")
-    lines.append("    These criteria will be used to evaluate your solutions. Use them to:")
-    lines.append("    - Avoid proposing solutions with obviously fatal flaws")
-    lines.append("    - Flag risks that match significant/minor conditions")
-    lines.append("    - Be explicit about trade-offs on the weighted dimensions")
-    lines.append("")
-    lines.append("    VIABILITY: ")
-    lines.append("      [Include viability criteria from FINALIZED_CRITERIA]")
-    lines.append("      A solution must meet ALL these criteria to be considered viable.")
-    lines.append("")
-    lines.append("    FLAW SEVERITY:")
-    lines.append("      FATAL (solution will be eliminated):")
-    lines.append("        [List fatal conditions from FINALIZED_CRITERIA]")
-    lines.append("")
-    lines.append("      SIGNIFICANT (solution viable but with documented issues):")
-    lines.append("        [List significant conditions from FINALIZED_CRITERIA]")
-    lines.append("")
-    lines.append("      MINOR (noted as trade-off):")
-    lines.append("        [List minor conditions from FINALIZED_CRITERIA]")
-    lines.append("")
-    lines.append("    TRADEOFF DIMENSIONS:")
-    lines.append("      PRIMARY (weighted in ranking):")
-    lines.append("        [List primary dimensions with weights from FINALIZED_CRITERIA]")
-    lines.append("")
-    lines.append("      When describing trade-offs, address these dimensions explicitly.")
-    lines.append("")
-    lines.append("    GUIDANCE:")
-    lines.append("    - Still explore your perspective FULLY--do not only generate 'safe' solutions")
-    lines.append("    - If your perspective suggests something that might hit a fatal condition,")
-    lines.append("      either explain why it doesn't, or note the risk explicitly")
-    lines.append("    - Be specific about how your solutions perform on the primary trade-off dimensions")
-    lines.append("")
-    lines.append(f'    Start: <invoke working-dir=".claude/skills/scripts" cmd="python3 -m {PERSPECTIVE_MODULE_PATH} --step 1 --total-steps 2 --perspective $PERSPECTIVE_ID" />')
+    lines.append(f"    Start: {invoke_cmd}")
     lines.append("  </agent_prompt_template>")
+
     lines.append("</parallel_dispatch>")
+
     return "\n".join(lines)
 
 
 def format_forbidden(actions: list[str]) -> str:
     """Render forbidden actions block."""
-    lines = ["<forbidden>"]
-    for action in actions:
-        lines.append(f"  <action>{action}</action>")
-    lines.append("</forbidden>")
-    return "\n".join(lines)
+    action_nodes = [ElementNode("action", {}, [TextNode(a)]) for a in actions]
+    return render(W.el("forbidden", *action_nodes).build(), XMLRenderer())
 
 
 def format_synthesis_analysis_template() -> str:
@@ -501,7 +528,7 @@ STEPS = {
     4: {
         "title": "Dispatch",
         "brief": "Launch all perspectives as parallel sub-agents",
-        "needs_dispatch": True,  # Flag for format_output
+        "needs_dispatch": True,
     },
     5: {
         "title": "Aggregate",
@@ -764,8 +791,107 @@ STEPS = {
 
 
 # =============================================================================
-# Output Formatting
+# Step Handlers
 # =============================================================================
+
+
+def step_handler(ctx: StepContext) -> tuple[Outcome, dict]:
+    """Generic handler for output-only steps."""
+    return Outcome.OK, {}
+
+
+# =============================================================================
+# Workflow Definition
+# =============================================================================
+
+
+WORKFLOW = Workflow(
+    "solution-design",
+    StepDef(
+        id="context",
+        title="Context",
+        phase="PREPARATION",
+        actions=STEPS[1]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "calibrate"},
+    ),
+    StepDef(
+        id="calibrate",
+        title="Calibrate",
+        phase="PREPARATION",
+        actions=STEPS[2]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "reflect"},
+    ),
+    StepDef(
+        id="reflect",
+        title="Reflect",
+        phase="PREPARATION",
+        actions=STEPS[3]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "dispatch"},
+    ),
+    StepDef(
+        id="dispatch",
+        title="Dispatch",
+        phase="GENERATION",
+        actions=[
+            "DISPATCH ALL PERSPECTIVE SUB-AGENTS",
+            "",
+            "Using the ROOT_CAUSE, CONSTRAINTS from Step 1",
+            "and FINALIZED_CRITERIA from Step 3:",
+            "",
+            format_perspective_selection_guidance(),
+            "",
+            build_perspective_dispatch(),
+            "",
+            "WAIT for all perspective agents to complete before proceeding.",
+        ],
+        handler=step_handler,
+        next={Outcome.OK: "aggregate"},
+    ),
+    StepDef(
+        id="aggregate",
+        title="Aggregate",
+        phase="GENERATION",
+        actions=STEPS[5]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "synthesize"},
+    ),
+    StepDef(
+        id="synthesize",
+        title="Synthesize",
+        phase="EVALUATION",
+        actions=STEPS[6]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "challenge"},
+    ),
+    StepDef(
+        id="challenge",
+        title="Challenge",
+        phase="EVALUATION",
+        actions=STEPS[7]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "select"},
+    ),
+    StepDef(
+        id="select",
+        title="Select",
+        phase="EVALUATION",
+        actions=STEPS[8]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: "output"},
+    ),
+    StepDef(
+        id="output",
+        title="Output",
+        phase="DELIVERY",
+        actions=STEPS[9]["actions"],
+        handler=step_handler,
+        next={Outcome.OK: None},
+    ),
+    description="Perspective-parallel solution generation workflow",
+)
 
 
 def format_output(step: int, total_steps: int) -> str:
@@ -776,12 +902,27 @@ def format_output(step: int, total_steps: int) -> str:
     parts = []
 
     # Step header
-    parts.append(format_step_header("design", step, total_steps, info["title"]))
+    parts.append(render(
+        W.el("step_header", TextNode(info["title"]),
+            script="design", step=str(step), total=str(total_steps)
+        ).build(),
+        XMLRenderer()
+    ))
     parts.append("")
 
     # XML mandate for step 1
     if step == 1:
-        parts.append(format_xml_mandate())
+        xml_mandate = """<xml_format_mandate>
+CRITICAL: All script outputs use XML format. You MUST:
+
+1. Execute the action in <current_action>
+2. When complete, invoke the exact command in <invoke_after>
+3. The <next> block re-states the command -- execute it
+4. For branching <invoke_after>, choose based on outcome:
+   - <if_pass>: Use when action succeeded / QR returned PASS
+   - <if_fail>: Use when action failed / QR returned ISSUES
+</xml_format_mandate>"""
+        parts.append(xml_mandate)
         parts.append("")
 
     # Build actions
@@ -796,7 +937,7 @@ def format_output(step: int, total_steps: int) -> str:
         actions.append("")
         actions.append(format_perspective_selection_guidance())
         actions.append("")
-        actions.append(format_parallel_dispatch())
+        actions.append(build_perspective_dispatch())
         actions.append("")
         actions.append("WAIT for all perspective agents to complete before proceeding.")
     else:
@@ -804,7 +945,8 @@ def format_output(step: int, total_steps: int) -> str:
         if "actions" in info:
             actions.extend(info["actions"])
 
-    parts.append(format_current_action(actions))
+    action_nodes = [TextNode(a) for a in actions]
+    parts.append(render(W.el("current_action", *action_nodes).build(), XMLRenderer()))
     parts.append("")
 
     # Invoke after
@@ -812,19 +954,21 @@ def format_output(step: int, total_steps: int) -> str:
         parts.append("COMPLETE - Present final report to user.")
     else:
         next_step = step + 1
-        parts.append(format_invoke_after(
-            f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step {next_step} --total-steps {total_steps}" />'
-        ))
+        cmd_text = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step {next_step} --total-steps {total_steps}" />'
+        parts.append(render(W.el("invoke_after", TextNode(cmd_text)).build(), XMLRenderer()))
 
     return "\n".join(parts)
 
 
-# =============================================================================
-# Main
-# =============================================================================
+def main(
+    step: int = None,
+    total_steps: int = None,
+):
+    """Entry point with backward compatibility for CLI invocation.
 
-
-def main():
+    Note: Parameters have defaults because actual values come from argparse.
+    The annotations are metadata for the testing framework.
+    """
     parser = argparse.ArgumentParser(
         description="Solution Design Skill - Perspective-parallel solution generation",
         epilog="Steps: context -> calibrate -> reflect -> dispatch -> aggregate -> synthesize -> challenge -> select -> output",

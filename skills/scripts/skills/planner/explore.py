@@ -14,10 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from skills.lib.workflow.formatters import (
-    format_step_output,
-    format_step_header,
-)
+from skills.lib.workflow.ast import W, XMLRenderer, render, TextNode
 
 
 # Module path for -m invocation
@@ -199,7 +196,17 @@ STEPS = {
             "  - Merge redundant information",
             "  - Keep file:line references for verifiable claims",
             "  - Patterns: HOW they work, not just THAT they exist",
-            "  - Aim for ~500 tokens per section (~1500 total)",
+            "",
+            "TOKEN BUDGET (ENFORCED - not soft guidance):",
+            "  - Total return: MAX 1500 tokens",
+            "  - Per section: MAX 500 tokens",
+            "  - Per finding: MAX 50 tokens",
+            "",
+            "  VERBOSE (wrong): 'The module implements a factory pattern that",
+            "                    creates service instances, enabling DI...'",
+            "  DRAFT (right):   'Factory pattern -> DI + testability'",
+            "",
+            "  If findings exceed budget, OMIT low-relevance items.",
             "",
             "OUTPUT: XML-formatted exploration output using this schema:",
             "",
@@ -209,32 +216,49 @@ STEPS = {
 }
 
 
+def step_5_handler(step_info, total_steps):
+    """Handler for step 5 (include output schema)."""
+    actions = list(step_info.get("actions", []))
+    schema = get_output_schema()
+    actions.append("<output_schema>")
+    actions.append(schema)
+    actions.append("</output_schema>")
+    return {
+        "title": step_info["title"],
+        "actions": actions,
+        "next": None,
+    }
+
+
+def generic_step_handler(step_info, step, total_steps):
+    """Generic handler for standard steps."""
+    actions = list(step_info.get("actions", []))
+    next_cmd = None
+    if step < total_steps:
+        next_cmd = f"python3 -m {MODULE_PATH} --step {step + 1} --total-steps {total_steps}"
+    return {
+        "title": step_info["title"],
+        "actions": actions,
+        "next": next_cmd,
+    }
+
+
+STEP_HANDLERS = {
+    5: step_5_handler,
+}
+
+
 def get_step_guidance(step: int, total_steps: int) -> dict:
     """Return guidance dict for the specified step."""
     info = STEPS.get(step)
     if not info:
         return {"error": f"Invalid step {step}"}
 
-    actions = list(info.get("actions", []))
-
-    # Append output schema for step 5
-    if info.get("include_output_format"):
-        schema = get_output_schema()
-        actions.append("<output_schema>")
-        actions.append(schema)
-        actions.append("</output_schema>")
-
-    # Determine next step
-    if step < total_steps:
-        next_cmd = f"python3 -m {MODULE_PATH} --step {step + 1} --total-steps {total_steps}"
+    handler = STEP_HANDLERS.get(step, generic_step_handler)
+    if step == 5:
+        return handler(info, total_steps)
     else:
-        next_cmd = None  # Final step
-
-    return {
-        "title": info["title"],
-        "actions": actions,
-        "next": next_cmd,
-    }
+        return handler(info, step, total_steps)
 
 
 def format_output(step: int, total_steps: int) -> str:
@@ -244,15 +268,59 @@ def format_output(step: int, total_steps: int) -> str:
     if "error" in guidance:
         return f"Error: {guidance['error']}"
 
-    return format_step_output(
-        script="explore",
-        step=step,
-        total=total_steps,
-        title=guidance["title"],
-        actions=guidance["actions"],
-        next_command=guidance.get("next"),
-        is_step_one=(step == 1),
-    )
+    parts = []
+
+    # Step header
+    parts.append(render(
+        W.el("step_header", TextNode(guidance["title"]),
+            script="explore", step=str(step), total=str(total_steps)
+        ).build(),
+        XMLRenderer()
+    ))
+    parts.append("")
+
+    # XML mandate for step 1
+    if step == 1:
+        parts.append("<xml_format_mandate>")
+        parts.append("CRITICAL: All script outputs use XML format. You MUST:")
+        parts.append("")
+        parts.append("1. Execute the action in <current_action>")
+        parts.append("2. When complete, invoke the exact command in <invoke_after>")
+        parts.append("3. The <next> block re-states the command -- execute it")
+        parts.append("4. For branching <invoke_after>, choose based on outcome:")
+        parts.append("   - <if_pass>: Use when action succeeded / QR returned PASS")
+        parts.append("   - <if_fail>: Use when action failed / QR returned ISSUES")
+        parts.append("")
+        parts.append("DO NOT modify commands. DO NOT skip steps. DO NOT interpret.")
+        parts.append("</xml_format_mandate>")
+        parts.append("")
+        parts.append("<thinking_efficiency>")
+        parts.append("Max 5 words per step. Symbolic notation preferred.")
+        parts.append('Good: "Patterns needed -> grep auth -> found 3"')
+        parts.append('Bad: "For the patterns we need, let me search for auth..."')
+        parts.append("</thinking_efficiency>")
+        parts.append("")
+
+    # Current action
+    action_nodes = [TextNode(a) for a in guidance["actions"]]
+    parts.append(render(W.el("current_action", *action_nodes).build(), XMLRenderer()))
+
+    # Invoke after and next block
+    next_command = guidance.get("next")
+    if next_command:
+        parts.append("")
+        parts.append(render(W.el("invoke_after", TextNode(next_command)).build(), XMLRenderer()))
+        parts.append("")
+        parts.append(render(
+            W.el("next",
+                TextNode("After current_action completes, execute invoke_after."),
+                TextNode(f"Re-read now: {next_command}"),
+                required="true"
+            ).build(),
+            XMLRenderer()
+        ))
+
+    return "\n".join(parts)
 
 
 def main():

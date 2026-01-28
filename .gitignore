@@ -2,6 +2,8 @@
 *
 
 # Track these directories and their contents
+!.github/
+!.github/**
 !agents/
 !agents/**
 !commands/
@@ -22,12 +24,5 @@
 # OS
 .DS_Store
 **/.DS_Store
-**/Thumbs.db
-**/desktop.ini
 
-# Temporary files
-**/*.tmp
-**/*.temp
-**/*.log
-**/*.bak
-**/*.orig
+**/__pycache__

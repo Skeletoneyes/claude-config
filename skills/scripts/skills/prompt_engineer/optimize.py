@@ -3,9 +3,9 @@
 Prompt Engineer Skill - Scope-adaptive prompt optimization workflow.
 
 Architecture:
-  - Per-scope WorkflowDefinition with shared Step constants
-  - Factory functions for reusable action fragments
-  - Step count derived from scope (no --total-steps)
+  - Four Workflow instances (one per scope)
+  - Shared action factories for reusable fragments
+  - Entry point dispatches to appropriate workflow
 
 Scopes:
   - single-prompt: One prompt file, general optimization
@@ -20,13 +20,17 @@ Research grounding:
 
 import argparse
 import sys
+from typing import Annotated
 
-from skills.lib.workflow.types import (
-    Step,
-    LinearRouting,
-    TerminalRouting,
-    WorkflowDefinition,
+from skills.lib.workflow.core import (
+    Arg,
+    Outcome,
+    StepContext,
+    StepDef,
+    Workflow,
 )
+from skills.lib.workflow.ast import W, XMLRenderer, render
+from skills.lib.workflow.ast.nodes import TextNode
 
 
 # =============================================================================
@@ -225,6 +229,37 @@ def understand_actions_simple() -> list[str]:
     ]
 
 
+def compression_guide_framing() -> list[str]:
+    """Framing for how to interpret the compression guide.
+
+    The compression guide operates at the OUTPUT level -- it contains techniques
+    to embed in prompts that cause the target LLM to produce fewer tokens.
+    Without this framing, LLMs pattern-match compression techniques to whatever
+    text is salient, often applying them incorrectly to code structure or
+    prompt text itself.
+    """
+    return [
+        "",
+        "CRITICAL - How to interpret the compression guide:",
+        "  The compression guide reduces OUTPUT tokens from the TARGET LLM --",
+        "  the LLM that will eventually READ the prompt you're optimizing,",
+        "  NOT the LLM (you) currently doing the optimization.",
+        "",
+        "  These are techniques to EMBED in prompts. When the guide says",
+        "  'keep each step to 5 words', that instruction goes INTO the prompt",
+        "  you're creating, so the target LLM responds concisely.",
+        "",
+        "  FORBIDDEN:",
+        "    - Refactoring code structure (extracting to variables, consolidating",
+        "      templates). Source code structure does NOT affect token count.",
+        "    - Shortening the prompt text itself unless user explicitly requests.",
+        "",
+        "  CORRECT: Look for opportunities to add output-controlling instructions",
+        "  like response format constraints, per-step word limits, or MARP patterns.",
+        "",
+    ]
+
+
 def handoff_minimalism_test() -> list[str]:
     """Test for handoff minimalism in PLAN phase."""
     return [
@@ -240,44 +275,46 @@ def handoff_minimalism_test() -> list[str]:
 
 
 # =============================================================================
-# READ Specifications (injected at PLAN step - varies by scope)
+# Handler Functions
 # =============================================================================
 
-# Maps scope -> (step_number, read_specs)
-READ_SPECS: dict[str, tuple[int, list[str]]] = {
-    "single-prompt": (4, [  # Plan is step 4
-        "references/prompt-engineering-single-turn.md",
-        "  -> Extract: Technique Selection Guide table",
-        "  -> For each technique: note Trigger Condition column",
-        "If multi-turn patterns detected: also read multi-turn reference.",
-    ]),
-    "ecosystem": (5, [  # Plan is step 5
-        "references/prompt-engineering-single-turn.md",
-        "references/prompt-engineering-multi-turn.md (always for ecosystem)",
-        "  -> Extract: Technique Selection Guide from each",
-        "  -> For each technique: note Trigger Condition column",
-        "If orchestration or human gates: also read subagents/hitl refs.",
-    ]),
-    "greenfield": (4, [  # Design is step 4
-        "references/prompt-engineering-single-turn.md",
-        "  -> Extract: Technique Selection Guide table",
-        "  -> For each technique: note Trigger Condition column",
-        "If multi-turn architecture chosen: also read multi-turn reference.",
-    ]),
-    "problem": (4, [  # Target Fix is step 4
-        "references/prompt-engineering-single-turn.md",
-        "  -> Extract: Technique Selection Guide table",
-        "  -> Focus on techniques matching the problem class",
-        "If problem involves multi-turn patterns: also read multi-turn reference.",
-    ]),
-}
+
+def step_handler(
+    ctx: StepContext,
+    scope: Annotated[
+        str,
+        Arg(
+            required=True,
+            description="Workflow scope (required for steps 2+)",
+            choices=("single-prompt", "ecosystem", "greenfield", "problem"),
+        ),
+    ],
+) -> tuple[Outcome, dict]:
+    """Generic handler for output-only steps."""
+    return Outcome.OK, {}
+
+
+def step_triage(
+    ctx: StepContext,
+    scope: Annotated[
+        str | None,
+        Arg(
+            description="Scope determined in step 1",
+            choices=("single-prompt", "ecosystem", "greenfield", "problem"),
+        ),
+    ] = None,
+) -> tuple[Outcome, dict]:
+    """Handler for triage step with scope parameter."""
+    return Outcome.OK, {}
 
 
 # =============================================================================
-# Shared Step Constants
+# Workflow Definitions
 # =============================================================================
 
-STEP_TRIAGE = Step(
+# Shared steps
+STEP_TRIAGE = StepDef(
+    id="triage",
     title="Triage",
     actions=[
         "EXAMINE the input and request:",
@@ -306,12 +343,13 @@ STEP_TRIAGE = Step(
         "  SCOPE: [single-prompt | ecosystem | greenfield | problem]",
         "  RATIONALE: [why this scope fits]",
     ],
-    routing=LinearRouting(),
+    handler=step_triage,
+    next={Outcome.OK: "assess"},
     phase="triage",
 )
 
-
-STEP_REFINE = Step(
+STEP_REFINE = StepDef(
+    id="refine",
     title="Refine",
     actions=[
         "VERIFY each proposed technique (factored verification):",
@@ -333,6 +371,26 @@ STEP_REFINE = Step(
         "",
         "UPDATE proposals based on verification.",
         "",
+        "META-CONSTRAINT VERIFICATION:",
+        "  For EACH proposed change:",
+        "  Q: Does this change modify PROMPT TEXT STRUCTURE or add OUTPUT INSTRUCTIONS?",
+        "  A: [Classify: quote the change and state which]",
+        "",
+        "  PROMPT TEXT STRUCTURE changes include:",
+        "    - Shortening/compressing existing prompt text",
+        "    - Removing sections or examples from prompt",
+        "    - Refactoring code structure (extracting to variables, etc.)",
+        "",
+        "  OUTPUT INSTRUCTIONS changes include:",
+        "    - Adding response format constraints",
+        "    - Adding per-step word limits",
+        "    - Adding output structure requirements",
+        "",
+        "  If ANY changes modify prompt text structure:",
+        "    -> VIOLATION of meta-constraint",
+        "    -> REMOVE these changes",
+        "    -> REVISE to add output instructions instead",
+        "",
         "CONTEXT-CORRECTNESS VERIFICATION (for greenfield/problem scopes):",
         "  If execution context was identified (STANDALONE/SKILL/SUB-AGENT/COMPONENT):",
         "",
@@ -347,12 +405,13 @@ STEP_REFINE = Step(
         "",
         "  If INCONSISTENT: flag for revision before Approve step.",
     ],
-    routing=LinearRouting(),
+    handler=step_handler,
+    next={Outcome.OK: "approve"},
     phase="verify",
 )
 
-
-STEP_APPROVE = Step(
+STEP_APPROVE = StepDef(
+    id="approve",
     title="Approve",
     actions=[
         "Present using this format:",
@@ -379,18 +438,18 @@ STEP_APPROVE = Step(
         "CRITICAL: STOP. Do NOT proceed to Execute step.",
         "Wait for explicit user approval before continuing.",
     ],
-    routing=LinearRouting(),
+    handler=step_handler,
+    next={Outcome.OK: "execute"},
     phase="approve",
 )
 
 
-# =============================================================================
-# Per-Scope Step Definitions
-# =============================================================================
-
-SINGLE_PROMPT_STEPS: dict[int, Step] = {
-    1: STEP_TRIAGE,
-    2: Step(
+# Single-prompt workflow
+WORKFLOW_SINGLE = Workflow(
+    "prompt-engineer-single",
+    STEP_TRIAGE,
+    StepDef(
+        id="assess",
         title="Assess",
         actions=[
             "READ the prompt file. Classify complexity:",
@@ -402,18 +461,20 @@ SINGLE_PROMPT_STEPS: dict[int, Step] = {
             "  - Agent type: tool-use, coding, analysis, general?",
             "  - Failure modes: what goes wrong when this fails?",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "understand"},
         phase="assess",
     ),
-    3: Step(
+    StepDef(
+        id="understand",
         title="Understand",
-        actions=[
-            *understand_actions_simple(),
-        ],
-        routing=LinearRouting(),
+        actions=understand_actions_simple(),
+        handler=step_handler,
+        next={Outcome.OK: "plan"},
         phase="understand",
     ),
-    4: Step(
+    StepDef(
+        id="plan",
         title="Plan",
         actions=[
             "BLIND identification of opportunities (quote line evidence):",
@@ -425,12 +486,14 @@ SINGLE_PROMPT_STEPS: dict[int, Step] = {
             "",
             "Include TECHNIQUE DISPOSITION summary.",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "refine"},
         phase="plan",
     ),
-    5: STEP_REFINE,
-    6: STEP_APPROVE,
-    7: Step(
+    STEP_REFINE,
+    STEP_APPROVE,
+    StepDef(
+        id="execute",
         title="Execute",
         actions=[
             "Apply each approved change to the prompt file.",
@@ -445,15 +508,20 @@ SINGLE_PROMPT_STEPS: dict[int, Step] = {
             "",
             *change_presentation_actions(),
         ],
-        routing=TerminalRouting(),
+        handler=step_handler,
+        next={Outcome.OK: None},
         phase="execute",
     ),
-}
+    description="Optimize a single prompt file",
+)
 
 
-ECOSYSTEM_STEPS: dict[int, Step] = {
-    1: STEP_TRIAGE,
-    2: Step(
+# Ecosystem workflow
+WORKFLOW_ECOSYSTEM = Workflow(
+    "prompt-engineer-ecosystem",
+    STEP_TRIAGE,
+    StepDef(
+        id="assess",
         title="Assess",
         actions=[
             "READ all prompt-containing files in scope.",
@@ -470,26 +538,28 @@ ECOSYSTEM_STEPS: dict[int, Step] = {
             "  - What it receives from / passes to other prompts",
             "  - Complexity classification",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "understand"},
         phase="assess",
     ),
-    3: Step(
+    StepDef(
+        id="understand",
         title="Understand",
-        actions=[
-            *understand_actions_ecosystem(),
-        ],
-        routing=LinearRouting(),
+        actions=understand_actions_ecosystem(),
+        handler=step_handler,
+        next={Outcome.OK: "verify_understanding"},
         phase="understand",
     ),
-    4: Step(
+    StepDef(
+        id="verify_understanding",
         title="Verify Understanding",
-        actions=[
-            *verify_understanding_actions(),
-        ],
-        routing=LinearRouting(),
+        actions=verify_understanding_actions(),
+        handler=step_handler,
+        next={Outcome.OK: "plan"},
         phase="verify_understanding",
     ),
-    5: Step(
+    StepDef(
+        id="plan",
         title="Plan",
         actions=[
             "FOR EACH PROMPT - identify opportunities:",
@@ -509,12 +579,14 @@ ECOSYSTEM_STEPS: dict[int, Step] = {
             *change_format_actions("CHANGE"),
             "Note which changes affect single file vs multiple.",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "refine"},
         phase="plan",
     ),
-    6: STEP_REFINE,
-    7: STEP_APPROVE,
-    8: Step(
+    STEP_REFINE,
+    STEP_APPROVE,
+    StepDef(
+        id="execute",
         title="Execute",
         actions=[
             "Apply changes to each file.",
@@ -528,15 +600,20 @@ ECOSYSTEM_STEPS: dict[int, Step] = {
             "",
             *change_presentation_actions(),
         ],
-        routing=TerminalRouting(),
+        handler=step_handler,
+        next={Outcome.OK: None},
         phase="execute",
     ),
-}
+    description="Optimize multiple related prompts",
+)
 
 
-GREENFIELD_STEPS: dict[int, Step] = {
-    1: STEP_TRIAGE,
-    2: Step(
+# Greenfield workflow
+WORKFLOW_GREENFIELD = Workflow(
+    "prompt-engineer-greenfield",
+    STEP_TRIAGE,
+    StepDef(
+        id="assess",
         title="Assess Requirements",
         actions=[
             "UNDERSTAND requirements:",
@@ -569,10 +646,12 @@ GREENFIELD_STEPS: dict[int, Step] = {
             "  - What errors are expected?",
             "  - What should NOT happen?",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "understand"},
         phase="assess",
     ),
-    3: Step(
+    StepDef(
+        id="understand",
         title="Understand",
         actions=[
             "ARTICULATE semantic understanding of what you're building:",
@@ -617,10 +696,12 @@ GREENFIELD_STEPS: dict[int, Step] = {
             "  WHY RIGHT: Bounded task, minimal context, clear output contract.",
             "</example>",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "design"},
         phase="understand",
     ),
-    4: Step(
+    StepDef(
+        id="design",
         title="Design",
         actions=[
             "SELECT applicable techniques for the design:",
@@ -683,12 +764,14 @@ GREENFIELD_STEPS: dict[int, Step] = {
             "",
             "WRITE complete prompt draft.",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "refine"},
         phase="plan",
     ),
-    5: STEP_REFINE,
-    6: STEP_APPROVE,
-    7: Step(
+    STEP_REFINE,
+    STEP_APPROVE,
+    StepDef(
+        id="execute",
         title="Create",
         actions=[
             "CREATE the prompt file(s).",
@@ -703,15 +786,20 @@ GREENFIELD_STEPS: dict[int, Step] = {
             "",
             *change_presentation_actions(),
         ],
-        routing=TerminalRouting(),
+        handler=step_handler,
+        next={Outcome.OK: None},
         phase="execute",
     ),
-}
+    description="Design a new prompt from requirements",
+)
 
 
-PROBLEM_STEPS: dict[int, Step] = {
-    1: STEP_TRIAGE,
-    2: Step(
+# Problem workflow
+WORKFLOW_PROBLEM = Workflow(
+    "prompt-engineer-problem",
+    STEP_TRIAGE,
+    StepDef(
+        id="assess",
         title="Diagnose",
         actions=[
             "UNDERSTAND the problem:",
@@ -730,18 +818,20 @@ PROBLEM_STEPS: dict[int, Step] = {
             "If NOT a prompting issue: state clearly and STOP.",
             "If prompting issue: identify lines that may contribute.",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "understand"},
         phase="diagnose",
     ),
-    3: Step(
+    StepDef(
+        id="understand",
         title="Understand",
-        actions=[
-            *understand_actions_simple(),
-        ],
-        routing=LinearRouting(),
+        actions=understand_actions_simple(),
+        handler=step_handler,
+        next={Outcome.OK: "plan"},
         phase="understand",
     ),
-    4: Step(
+    StepDef(
+        id="plan",
         title="Target Fix",
         actions=[
             "REVERSE LOOKUP - which techniques address this problem class?",
@@ -755,12 +845,14 @@ PROBLEM_STEPS: dict[int, Step] = {
             *change_format_actions("FIX"),
             "  Expected effect: [how this fixes the problem]",
         ],
-        routing=LinearRouting(),
+        handler=step_handler,
+        next={Outcome.OK: "refine"},
         phase="plan",
     ),
-    5: STEP_REFINE,
-    6: STEP_APPROVE,
-    7: Step(
+    STEP_REFINE,
+    STEP_APPROVE,
+    StepDef(
+        id="execute",
         title="Apply Fix",
         actions=[
             "Apply targeted fix to the prompt.",
@@ -771,154 +863,101 @@ PROBLEM_STEPS: dict[int, Step] = {
             "",
             *change_presentation_actions(),
         ],
-        routing=TerminalRouting(),
+        handler=step_handler,
+        next={Outcome.OK: None},
         phase="execute",
     ),
+    description="Fix a specific issue in existing prompt(s)",
+)
+
+
+# Root workflow for triage entry point
+# Uses a modified triage step that terminates instead of continuing to "assess"
+STEP_TRIAGE_ROOT = StepDef(
+    id="triage",
+    title="Triage",
+    actions=STEP_TRIAGE.actions,
+    handler=step_triage,
+    next={Outcome.OK: None},
+    phase="triage",
+)
+
+WORKFLOW_ROOT = Workflow(
+    "prompt-engineer",
+    STEP_TRIAGE_ROOT,
+    description="Scope-adaptive prompt optimization (triage entry point)",
+)
+
+
+
+# Scope mapping
+SCOPES = {
+    "single-prompt": WORKFLOW_SINGLE,
+    "ecosystem": WORKFLOW_ECOSYSTEM,
+    "greenfield": WORKFLOW_GREENFIELD,
+    "problem": WORKFLOW_PROBLEM,
 }
 
 
-# =============================================================================
-# Workflow Registry
-# =============================================================================
+def format_prompt_engineer_output(step, total, scope, step_def, read_section, next_command, is_step_one=False):
+    """Format output using AST builder API."""
+    parts = []
+    title = f"PROMPT ENGINEER - {step_def.title}"
+    attrs = {"script": "prompt_engineer", "step": str(step), "total": str(total)}
+    if scope:
+        attrs["scope"] = scope
+    parts.append(render(W.el("step_header", TextNode(title), **attrs).build(), XMLRenderer()))
+    parts.append("")
 
-WORKFLOWS: dict[str, WorkflowDefinition] = {
-    "single-prompt": WorkflowDefinition(
-        name="prompt-engineer-single",
-        script="skills.prompt_engineer.optimize",
-        steps=SINGLE_PROMPT_STEPS,
-        description="Optimize a single prompt file",
-    ),
-    "ecosystem": WorkflowDefinition(
-        name="prompt-engineer-ecosystem",
-        script="skills.prompt_engineer.optimize",
-        steps=ECOSYSTEM_STEPS,
-        description="Optimize multiple related prompts",
-    ),
-    "greenfield": WorkflowDefinition(
-        name="prompt-engineer-greenfield",
-        script="skills.prompt_engineer.optimize",
-        steps=GREENFIELD_STEPS,
-        description="Design a new prompt from requirements",
-    ),
-    "problem": WorkflowDefinition(
-        name="prompt-engineer-problem",
-        script="skills.prompt_engineer.optimize",
-        steps=PROBLEM_STEPS,
-        description="Fix a specific issue in existing prompt(s)",
-    ),
-}
+    if scope:
+        parts.append(f"Scope: {scope.upper()}")
+        parts.append("")
 
-SCOPES = list(WORKFLOWS.keys())
+    if is_step_one:
+        parts.append("""<xml_format_mandate>
+CRITICAL: All script outputs use XML format. You MUST:
+1. Execute the action in <current_action>
+2. When complete, invoke the exact command in <invoke_after>
+3. DO NOT modify commands. DO NOT skip steps.
+</xml_format_mandate>""")
+        parts.append("")
 
+    if read_section:
+        read_nodes = [TextNode(line) for line in read_section]
+        parts.append(render(W.el("read_section", *read_nodes).build(), XMLRenderer()))
+        parts.append("")
 
-# =============================================================================
-# Runtime Functions
-# =============================================================================
+    action_nodes = [TextNode(a) for a in step_def.actions]
+    parts.append(render(W.el("current_action", *action_nodes).build(), XMLRenderer()))
+    parts.append("")
 
-
-def get_workflow(scope: str) -> WorkflowDefinition:
-    """Get workflow definition for a scope."""
-    if scope not in WORKFLOWS:
-        sys.exit(f"ERROR: Invalid scope '{scope}'. Valid: {SCOPES}")
-    return WORKFLOWS[scope]
-
-
-def get_step(scope: str, step_num: int) -> Step:
-    """Get a specific step from a scope's workflow."""
-    workflow = get_workflow(scope)
-    if step_num not in workflow.steps:
-        valid = sorted(workflow.steps.keys())
-        sys.exit(
-            f"ERROR: Step {step_num} not in {scope} workflow. Valid: {valid}"
-        )
-    return workflow.steps[step_num]
-
-
-def get_total_steps(scope: str) -> int:
-    """Get total step count for a scope."""
-    return max(get_workflow(scope).steps.keys())
-
-
-# =============================================================================
-# Output Formatting
-# =============================================================================
-
-
-def format_output(step: int, scope: str | None) -> str:
-    """Format output for LLM execution."""
-    # Step 1 is triage (no scope yet)
-    if step == 1:
-        step_info = STEP_TRIAGE
-        total = 6  # Display as 1/6 since we don't know scope yet
-        lines = [
-            f"PROMPT ENGINEER - Step {step}/{total}: {step_info.title}",
-            "",
-            "DO:",
-        ]
-        for action in step_info.actions:
-            lines.append(f"  {action}" if action else "")
-
-        lines.extend([
-            "",
-            "NEXT: Invoke step 2 with --scope <determined-scope>",
-        ])
-        return "\n".join(lines)
-
-    # Steps 2+ require scope
-    if scope is None:
-        sys.exit("ERROR: --scope required for steps 2+. Run step 1 first.")
-
-    step_info = get_step(scope, step)
-    total = get_total_steps(scope)
-
-    lines = [
-        f"PROMPT ENGINEER - Step {step}/{total}: {step_info.title}",
-        f"  Scope: {scope.upper()}",
-        "",
-    ]
-
-    # Inject READ section at the PLAN step (varies by scope)
-    if scope in READ_SPECS:
-        read_step, read_refs = READ_SPECS[scope]
-        if step == read_step:
-            lines.append("READ:")
-            for ref in read_refs:
-                lines.append(f"  - {ref}")
-            lines.append("")
-
-    lines.append("DO:")
-    for action in step_info.actions:
-        lines.append(f"  {action}" if action else "")
-
-    lines.append("")
-
-    # Next step or completion
-    if isinstance(step_info.routing, TerminalRouting):
-        lines.append("COMPLETE - Present results to user.")
+    if next_command:
+        parts.append(render(W.el("invoke_after", TextNode(next_command)).build(), XMLRenderer()))
     else:
-        next_step = step + 1
-        lines.append(
-            f"NEXT: python3 -m skills.prompt_engineer.optimize "
-            f"--step {next_step} --scope {scope}"
-        )
+        parts.append("WORKFLOW COMPLETE - Present results to user.")
 
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 
 # =============================================================================
-# CLI
+# CLI Entry Point
 # =============================================================================
 
 
-def main():
+def main(
+    step: int = None,
+    scope: str | None = None,
+):
+    """CLI entry point. Args come from argparse, not these defaults."""
     parser = argparse.ArgumentParser(
         description="Prompt Engineer - Scope-adaptive optimization workflow",
         epilog="Step 1: triage. Steps 2+: scope-specific workflow.",
     )
     parser.add_argument("--step", type=int, required=True)
+    parser.add_argument("--total-steps", type=int, help="Ignored (computed from scope)")
     parser.add_argument(
         "--scope",
-        choices=SCOPES,
+        choices=list(SCOPES.keys()),
         default=None,
         help="Required for steps 2+. Run step 1 first to determine scope.",
     )
@@ -927,21 +966,109 @@ def main():
     if args.step < 1:
         sys.exit("ERROR: --step must be >= 1")
 
-    # Validate step against scope's workflow
-    if args.step > 1:
-        if args.scope is None:
-            sys.exit(
-                "ERROR: --scope required for steps 2+. "
-                "Run step 1 first to determine scope."
-            )
-        total = get_total_steps(args.scope)
-        if args.step > total:
-            sys.exit(
-                f"ERROR: Step {args.step} exceeds total ({total}) "
-                f"for scope '{args.scope}'"
-            )
+    # Step 1 is triage (no scope yet)
+    if args.step == 1:
+        workflow = WORKFLOW_SINGLE
+        step_def = STEP_TRIAGE
+        total = 6
+        next_cmd = "python3 -m skills.prompt_engineer.optimize --step 2 --scope <determined-scope>"
+        output = format_prompt_engineer_output(
+            args.step, total, None, step_def, None, next_cmd, is_step_one=True
+        )
+        print(output)
+        return
 
-    print(format_output(args.step, args.scope))
+    # Steps 2+ require scope
+    if args.scope is None:
+        sys.exit(
+            "ERROR: --scope required for steps 2+. Run step 1 first to determine scope."
+        )
+
+    workflow = SCOPES[args.scope]
+    total = workflow.total_steps
+
+    if args.step > total:
+        sys.exit(
+            f"ERROR: Step {args.step} exceeds total ({total}) for scope '{args.scope}'"
+        )
+
+    # Map step number to step_id
+    step_ids = list(workflow.steps.keys())
+    step_id = step_ids[args.step - 1]
+    step_def = workflow.steps[step_id]
+
+    # Get next step info
+    next_step_def = None
+    if args.step < total:
+        next_step_id = step_ids[args.step]
+        next_step_def = workflow.steps[next_step_id]
+
+    # Inject READ section at plan/design steps
+    read_specs = {
+        "single-prompt": (4, [
+            "READ:",
+            "  - references/prompt-engineering-single-turn.md",
+            "  - references/prompt-engineering-compression.md (always)",
+            "  - Extract: Technique Selection Guide tables from both",
+            "  - For each technique: note Trigger Condition column",
+            "If multi-turn patterns detected: also read multi-turn reference.",
+        ]),
+        "ecosystem": (5, [
+            "READ (PROCESS SEQUENTIALLY):",
+            "",
+            "First: references/prompt-engineering-single-turn.md",
+            "  -> Extract: Technique Selection Guide",
+            "  -> For each technique: note Trigger Condition column",
+            "  -> Complete extraction before proceeding",
+            "",
+            "Then: references/prompt-engineering-multi-turn.md",
+            "  -> Extract: Technique Selection Guide",
+            "  -> For each technique: note Trigger Condition column",
+            "  -> Complete extraction before proceeding",
+            "",
+            "Finally: references/prompt-engineering-compression.md",
+            "  -> Extract: Technique Selection Guide",
+            "  -> For each technique: note Trigger Condition column",
+            "",
+            "If orchestration or human gates: also read subagents/hitl refs.",
+        ]),
+        "greenfield": (4, [
+            "READ:",
+            "  - references/prompt-engineering-single-turn.md",
+            "  - references/prompt-engineering-compression.md (always)",
+            "  - Extract: Technique Selection Guide tables from both",
+            "  - For each technique: note Trigger Condition column",
+            "If multi-turn architecture chosen: also read multi-turn reference.",
+        ]),
+        "problem": (4, [
+            "READ:",
+            "  - references/prompt-engineering-single-turn.md",
+            "  - references/prompt-engineering-compression.md (always)",
+            "  - Extract: Technique Selection Guide tables from both",
+            "  - Focus on techniques matching the problem class",
+            "If problem involves multi-turn patterns: also read multi-turn reference.",
+        ]),
+    }
+
+    read_section = None
+    if args.scope in read_specs:
+        read_step, read_refs = read_specs[args.scope]
+        if args.step == read_step:
+            read_section = read_refs
+
+    # Next step or completion
+    next_command = None
+    if step_def.next.get(Outcome.OK) is not None:
+        next_step = args.step + 1
+        next_command = (
+            f"python3 -m skills.prompt_engineer.optimize "
+            f"--step {next_step} --scope {args.scope}"
+        )
+
+    output = format_prompt_engineer_output(
+        args.step, total, args.scope, step_def, read_section, next_command
+    )
+    print(output)
 
 
 if __name__ == "__main__":

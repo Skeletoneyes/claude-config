@@ -10,10 +10,8 @@ Two-step workflow per perspective:
 import argparse
 import sys
 
-from skills.lib.workflow.formatters import (
-    format_xml_mandate,
-    format_current_action,
-)
+from skills.lib.workflow.ast import W, XMLRenderer, render, TextNode
+from skills.lib.workflow.types import FlatCommand
 from skills.solution_design.perspectives import PERSPECTIVES, PERSPECTIVE_ORDER
 
 
@@ -26,14 +24,14 @@ MODULE_PATH = "skills.solution_design.perspective"
 # =============================================================================
 
 
-def format_invoke_after(command: str) -> str:
-    """Render invoke after block for perspective workflow."""
-    return f"<invoke_after>\n{command}\n</invoke_after>"
-
-
 def format_step_header(step: int, total: int, title: str, perspective: str) -> str:
     """Render step header with perspective context."""
-    return f'<step_header script="perspective" step="{step}" total="{total}" perspective="{perspective}">{title}</step_header>'
+    return render(
+        W.el("step_header", TextNode(title),
+            script="perspective", step=str(step), total=str(total), perspective=perspective
+        ).build(),
+        XMLRenderer()
+    )
 
 
 def format_solution_template() -> str:
@@ -141,16 +139,28 @@ def format_step_1(perspective_id: str) -> str:
         "Generate your solutions now, then proceed to validation.",
     ]
 
+    xml_mandate = """<xml_format_mandate>
+CRITICAL: All script outputs use XML format. You MUST:
+
+1. Execute the action in <current_action>
+2. When complete, invoke the exact command in <invoke_after>
+3. The <next> block re-states the command -- execute it
+4. For branching <invoke_after>, choose based on outcome:
+   - <if_pass>: Use when action succeeded / QR returned PASS
+   - <if_fail>: Use when action failed / QR returned ISSUES
+</xml_format_mandate>"""
+
+    action_nodes = [TextNode(a) for a in actions]
+    cmd_text = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 2 --total-steps 2 --perspective {perspective_id}" />'
+
     parts = [
         format_step_header(1, 2, "Generate", perspective_id),
         "",
-        format_xml_mandate(),
+        xml_mandate,
         "",
-        format_current_action(actions),
+        render(W.el("current_action", *action_nodes).build(), XMLRenderer()),
         "",
-        format_invoke_after(
-            f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 2 --total-steps 2 --perspective {perspective_id}" />'
-        ),
+        render(W.el("invoke_after", TextNode(cmd_text)).build(), XMLRenderer()),
     ]
     return "\n".join(parts)
 
@@ -190,22 +200,28 @@ def format_step_2(perspective_id: str) -> str:
         f'OUTPUT your solutions now wrapped in <perspective_output id="{perspective_id}">.',
     ]
 
+    action_nodes = [TextNode(a) for a in actions]
+
     parts = [
         format_step_header(2, 2, "Validate", perspective_id),
         "",
-        format_current_action(actions),
+        render(W.el("current_action", *action_nodes).build(), XMLRenderer()),
         "",
         "COMPLETE - Return solutions to orchestrator.",
     ]
     return "\n".join(parts)
 
 
+STEP_HANDLERS = {
+    1: lambda perspective: format_step_1(perspective),
+    2: lambda perspective: format_step_2(perspective),
+}
+
+
 def format_output(step: int, total_steps: int, perspective: str) -> str:
     """Format output for the given step."""
-    if step == 1:
-        return format_step_1(perspective)
-    else:
-        return format_step_2(perspective)
+    handler = STEP_HANDLERS.get(step, lambda _: format_step_2(perspective))
+    return handler(perspective)
 
 
 # =============================================================================
