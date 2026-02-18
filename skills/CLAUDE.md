@@ -2,11 +2,27 @@
 
 Script-based agent workflows with shared orchestration framework.
 
+## MANDATORY: Read Before Modifying
+
+**STOP. Before editing ANY Python file in `skills/scripts/`, you MUST read `README.md`.**
+
+The README defines:
+
+- File section ordering (SHARED PROMPTS -> CONFIGURATION -> MESSAGE TEMPLATES -> MESSAGE BUILDERS -> STEP DEFINITIONS -> OUTPUT FORMATTING -> ENTRY POINT)
+- Step-delimited prompt organization within MESSAGE TEMPLATES
+- Naming conventions for prompt constants (`[PHASE]_[TYPE]`)
+- Patterns for dispatch prompts (static templates vs builder functions)
+- Anti-patterns to avoid (action factories, forward references)
+
+Failure to follow these patterns creates technical debt and inconsistency across skills. The patterns exist because they solve real problems with prompt readability and maintenance.
+
+**Read `README.md` now if you haven't already.**
+
 ## Files
 
-| File        | What                                 | When to read                                  |
-| ----------- | ------------------------------------ | --------------------------------------------- |
-| `README.md` | Skills architecture, design, catalog | Understanding skills system design, migration |
+| File        | What                                                      | When to read                    |
+| ----------- | --------------------------------------------------------- | ------------------------------- |
+| `README.md` | File organization, prompt patterns, naming, anti-patterns | BEFORE modifying any skill code |
 
 ## Subdirectories
 
@@ -16,7 +32,6 @@ Script-based agent workflows with shared orchestration framework.
 | `planner/`            | Planning and execution workflows          | Creating implementation plans            |
 | `refactor/`           | Refactoring analysis across dimensions    | Technical debt review, code quality      |
 | `problem-analysis/`   | Structured problem decomposition          | Understanding complex issues             |
-| `solution-design/`    | Perspective-parallel solution generation  | Generating diverse solutions             |
 | `decision-critic/`    | Decision stress-testing and critique      | Validating architectural choices         |
 | `deepthink/`          | Structured reasoning for open questions   | Analytical questions without frameworks  |
 | `codebase-analysis/`  | Systematic codebase exploration           | Repository architecture review           |
@@ -31,18 +46,8 @@ Script-based agent workflows with shared orchestration framework.
 
 All Python skill scripts are invoked as modules from `scripts/`:
 
-<invoke working-dir=".claude/skills/scripts" cmd="python3 -m skills.<skill_name>.<module> --step 1 --total-steps N" />
+<invoke working-dir=".claude/skills/scripts" cmd="python3 -m skills.<skill_name>.<module> --step 1" />
 
 Example:
 
-<invoke working-dir=".claude/skills/scripts" cmd="python3 -m skills.problem_analysis.analyze --step 1 --total-steps 5" />
-
-## Beads Integration
-
-Skills optionally integrate with beads (bd) for persistent cross-session issue tracking:
-- Planner: Creates feature/milestone issues, tracks progress during execution
-- Refactor: (planned) Creates issues for technical debt findings
-- Codebase Analysis: (planned) Creates issues for security/architecture findings
-
-Integration is optional and gracefully falls back to TodoWrite when beads is unavailable.
-See `.claude/conventions/beads-integration.md` for details.
+<invoke working-dir=".claude/skills/scripts" cmd="python3 -m skills.problem_analysis.analyze --step 1" />

@@ -4,11 +4,20 @@ Handles argument parsing and mode script entry points.
 """
 
 import argparse
-import sys
 from pathlib import Path
 from typing import Callable
 
-from .ast import W, XMLRenderer, render, TextNode
+from .prompts.step import format_step
+from .types import UserInputResponse
+
+
+# Injected on step 1 only. Replaces the deleted xml_format_mandate.
+THINKING_EFFICIENCY = (
+    "THINKING EFFICIENCY:\n"
+    "  Max 5 words per step. Symbolic notation preferred.\n"
+    '  Good: "Patterns needed -> grep auth -> found 3"\n'
+    '  Bad: "For the patterns we need, let me search for auth..."'
+)
 
 
 def _compute_module_path(script_file: str) -> str:
@@ -33,17 +42,31 @@ def _compute_module_path(script_file: str) -> str:
     return path.stem
 
 
-def add_qr_args(parser: argparse.ArgumentParser) -> None:
-    """Add standard QR verification arguments to argument parser.
-
-    Used by orchestrator scripts (planner.py, executor.py, wave-executor.py)
-    to ensure consistent QR-related CLI flags.
-    """
+def add_standard_args(parser: argparse.ArgumentParser) -> None:
+    """Add standard workflow arguments."""
+    parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--qr-iteration", type=int, default=1)
-    parser.add_argument("--qr-fail", action="store_true",
-                        help="Work step is fixing QR issues")
-    parser.add_argument("--qr-status", type=str, choices=["pass", "fail"],
-                        help="QR result for gate steps")
+    parser.add_argument("--qr-fail", type=str, default=None)
+    parser.add_argument(
+        "--user-answer-id",
+        type=str,
+        help="Question ID that was answered"
+    )
+    parser.add_argument(
+        "--user-answer-value",
+        type=str,
+        help="User's selected option or custom text"
+    )
+
+
+def get_user_answer(args) -> UserInputResponse | None:
+    """Extract user answer from parsed args."""
+    if args.user_answer_id and args.user_answer_value:
+        return UserInputResponse(
+            question_id=args.user_answer_id,
+            selected=args.user_answer_value,
+        )
+    return None
 
 
 def mode_main(
@@ -60,65 +83,42 @@ def mode_main(
         description: Script description for --help
         extra_args: Additional arguments beyond standard QR args
     """
-    script_name = Path(script_file).stem
     module_path = _compute_module_path(script_file)
 
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--step", type=int, required=True)
-    parser.add_argument("--total-steps", type=int, required=True)
     parser.add_argument("--qr-iteration", type=int, default=1)
-    parser.add_argument("--qr-fail", action="store_true")
+    parser.add_argument("--qr-fail", type=str, default=None)
     for args, kwargs in (extra_args or []):
         parser.add_argument(*args, **kwargs)
     parsed = parser.parse_args()
 
     guidance = get_step_guidance(
-        parsed.step, parsed.total_steps, module_path,
+        parsed.step, module_path,
         **{k: v for k, v in vars(parsed).items()
-           if k not in ('step', 'total_steps')}
+           if k not in ('step',)}
     )
 
     # Handle both dict and dataclass (GuidanceResult) returns
-    # Scripts use different patterns - some return dicts, others return GuidanceResult
     if hasattr(guidance, '__dataclass_fields__'):
-        # GuidanceResult dataclass - convert to dict
         guidance_dict = {
             "title": guidance.title,
             "actions": guidance.actions,
             "next": guidance.next_command,
         }
     else:
-        # Already a dict
         guidance_dict = guidance
 
-    # Build step output using AST builder
-    parts = []
-    parts.append(render(
-        W.el("step_header", TextNode(guidance_dict["title"]),
-             script=script_name, step=str(parsed.step), total=str(parsed.total_steps)
-        ).build(), XMLRenderer()
-    ))
+    # Build body from actions list
+    body_parts = []
     if parsed.step == 1:
-        parts.append("")
-        parts.append("<xml_format_mandate>")
-        parts.append("  All workflow output MUST be well-formed XML.")
-        parts.append("  Use CDATA for code: <![CDATA[...]]>")
-        parts.append("</xml_format_mandate>")
-        parts.append("")
-        parts.append("<thinking_efficiency>")
-        parts.append("Max 5 words per step. Symbolic notation preferred.")
-        parts.append('Good: "Patterns needed -> grep auth -> found 3"')
-        parts.append('Bad: "For the patterns we need, let me search for auth..."')
-        parts.append("</thinking_efficiency>")
-    parts.append("")
-    parts.append(render(
-        W.el("current_action", *[TextNode(a) for a in guidance_dict["actions"]]).build(),
-        XMLRenderer()
-    ))
-    if guidance_dict["next"]:
-        parts.append("")
-        parts.append(render(
-            W.el("invoke_after", TextNode(guidance_dict["next"])).build(),
-            XMLRenderer()
-        ))
-    print("\n".join(parts))
+        body_parts.append(THINKING_EFFICIENCY)
+        body_parts.append("")
+
+    for action in guidance_dict["actions"]:
+        body_parts.append(str(action))
+
+    body = "\n".join(body_parts)
+    next_cmd = guidance_dict.get("next", "")
+
+    print(format_step(body, next_cmd, title=guidance_dict["title"]))

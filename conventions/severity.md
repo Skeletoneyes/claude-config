@@ -38,15 +38,32 @@ Maintainability debt. Compounds but detectable later.
 | CONVENTION_VIOLATION        | Violates documented project convention       |
 | TESTING_STRATEGY_VIOLATION  | Tests don't follow confirmed strategy        |
 
+### DIAGRAM (MUST for semantic, COULD for format)
+
+Diagram graph integrity. Semantic issues block; format issues warn.
+
+| Category             | Severity | Detection                                  |
+| -------------------- | -------- | ------------------------------------------ |
+| ORPHAN_NODE          | MUST     | Node with zero edges                       |
+| INVALID_EDGE_REF     | MUST     | Edge source/target references missing node |
+| INVALID_SCOPE_REF    | MUST     | Scope references non-existent milestone    |
+| DIAGRAM_WIDTH_EXCEED | COULD    | ASCII render line > 80 chars               |
+| UNCLOSED_BOX         | COULD    | Box corners misaligned in ASCII render     |
+
 ### COSMETIC (COULD)
 
 Auto-fixable, minimal impact.
 
-| Category            | Detection                                |
-| ------------------- | ---------------------------------------- |
-| DEAD_CODE           | Unused functions, impossible branches    |
-| FORMATTER_FIXABLE   | Style issues fixable by formatter/linter |
-| MINOR_INCONSISTENCY | Non-conformance with no documented rule  |
+| Category            | Detection                                                  |
+| ------------------- | ---------------------------------------------------------- |
+| DEAD_CODE           | Unused functions, impossible branches                      |
+| FORMATTER_FIXABLE   | Style issues fixable by formatter/linter                   |
+| MINOR_INCONSISTENCY | Non-conformance with no documented rule                    |
+| TOOLCHAIN_CATCHABLE | Error in planned code that compiler/linter/interpreter     |
+|                     | would flag, where intended correct code is obvious from    |
+|                     | context (typos, missing imports, non-exhaustive match).    |
+|                     | NOT: errors revealing plan-level misunderstanding -- those |
+|                     | are ASSUMPTION_UNVALIDATED (MUST)                          |
 
 ## IK Proximity Rule
 

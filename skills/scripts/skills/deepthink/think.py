@@ -23,1311 +23,1008 @@ Two modes: Full (all steps) and Quick (skips 6-11).
 
 import argparse
 import sys
-from typing import Annotated
 
-from skills.lib.workflow.core import (
-    Arg,
-    Outcome,
-    StepContext,
-    StepDef,
-    Workflow,
-)
-from skills.lib.workflow.ast import W, XMLRenderer, render
-from skills.lib.workflow.ast.nodes import TextNode
+from skills.lib.workflow.prompts import format_step, roster_dispatch
 
 
-MAX_ITERATIONS = 5
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 MODULE_PATH = "skills.deepthink.think"
 SUBAGENT_MODULE_PATH = "skills.deepthink.subagent"
+MAX_ITERATIONS = 5
 
 
-def format_step_output(
-    step: int,
-    total: int,
-    title: str,
-    actions: list[str],
-    next_command: str = None,
-    is_step_zero: bool = False,
-) -> str:
-    """Format complete step output using AST builder API.
+# ============================================================================
+# MESSAGE TEMPLATES
+# ============================================================================
 
-    Args:
-        step: Current step number (1-indexed)
-        total: Total steps
-        title: Step title
-        actions: List of action strings
-        next_command: Command to invoke after (None = workflow complete)
-        is_step_zero: If True, prepend XML mandate (for step 1)
-    """
-    parts = []
+# --- STEP 1: CONTEXT_CLARIFICATION ------------------------------------------
 
-    # Step header
-    parts.append(render(
-        W.el("step_header", TextNode(title),
-            script="deepthink", step=str(step), total=str(total)
-        ).build(),
-        XMLRenderer()
-    ))
-    parts.append("")
+CONTEXT_CLARIFICATION_INSTRUCTIONS = (
+    "You are an expert analytical reasoner tasked with systematic deep analysis.\n"
+    "\n"
+    "PART 0 - CONTEXT SUFFICIENCY:\n"
+    "  Before analyzing, assess whether you have sufficient context:\n"
+    "\n"
+    "  A. EXISTING CONTEXT: What relevant information is already in this conversation?\n"
+    "     (prior codebase analysis, problem discoveries, architecture understanding)\n"
+    "\n"
+    "  B. SUFFICIENCY JUDGMENT: For this question, is existing context:\n"
+    "     - SUFFICIENT: Can reason directly from available information\n"
+    "     - PARTIAL: Have some context but need targeted exploration\n"
+    "     - INSUFFICIENT: Need exploration before meaningful reasoning\n"
+    "\n"
+    "  C. IF NOT SUFFICIENT: Before proceeding to Part A, explore:\n"
+    "     - Use Read/Glob/Grep tools to gather necessary context\n"
+    "     - Focus on specific files/patterns relevant to the question\n"
+    "     - Stop exploring when you have enough to reason -- avoid over-exploration\n"
+    "     - Document what you found in a brief EXPLORATION SUMMARY\n"
+    "\n"
+    "  If context is SUFFICIENT, proceed directly to Part A.\n"
+    "\n"
+    "Extract objective, relevant content from the user's question.\n"
+    "\n"
+    "Read the question again before proceeding.\n"
+    "\n"
+    "Separate it from framing, opinion, or irrelevant information.\n"
+    "\n"
+    "PART A - CLARIFIED QUESTION:\n"
+    "  Restate the core question in neutral, objective terms.\n"
+    "  Remove leading language, embedded opinions, or assumptions.\n"
+    "  If multiple sub-questions exist, list them clearly.\n"
+    "\n"
+    "PART B - EXTRACTED CONTEXT:\n"
+    "  List factual context from input relevant to answering.\n"
+    "  Exclude opinions, preferences, or irrelevant details.\n"
+    "\n"
+    "PART C - NOTED BIASES:\n"
+    "  Identify framing effects, leading language, or embedded assumptions.\n"
+    "  Note these so subsequent steps can guard against them.\n"
+    "  If none detected, state 'No significant biases detected.'\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "CLARIFIED QUESTION:\n"
+    "[neutral restatement]\n"
+    "\n"
+    "EXTRACTED CONTEXT:\n"
+    "- [fact 1]\n"
+    "- [fact 2]\n"
+    "\n"
+    "NOTED BIASES:\n"
+    "- [bias 1] or 'No significant biases detected.'\n"
+    "```\n"
+    "\n"
+    "The CLARIFIED QUESTION will be used as the working question for all subsequent steps."
+)
 
-    # XML mandate for step 1 (first step)
-    if is_step_zero:
-        parts.append("""<xml_format_mandate>
-CRITICAL: All script outputs use XML format. You MUST:
+# --- STEP 2: ABSTRACTION ----------------------------------------------------
 
-1. Execute the action in <current_action>
-2. When complete, invoke the exact command in <invoke_after>
-3. The <next> block re-states the command -- execute it
-4. For branching <invoke_after>, choose based on outcome:
-   - <if_pass>: Use when action succeeded / QR returned PASS
-   - <if_fail>: Use when action failed / QR returned ISSUES
+ABSTRACTION_INSTRUCTIONS = (
+    "Before diving into specifics, step back and identify high-level context.\n"
+    "Work through this thoroughly. Avoid shortcuts. Show reasoning step by step.\n"
+    "\n"
+    "PART A - DOMAIN:\n"
+    "  What field or domain does this question primarily belong to?\n"
+    "  Are there adjacent domains that might offer relevant perspectives?\n"
+    "\n"
+    "PART B - FIRST PRINCIPLES:\n"
+    "  What fundamental principles should guide any answer?\n"
+    "  What would an expert consider non-negotiable constraints or truths?\n"
+    "\n"
+    "PART C - KEY CONCEPTS:\n"
+    "  What core concepts must be understood to answer well?\n"
+    "  Define any terms that might be ambiguous or contested.\n"
+    "\n"
+    "PART D - WHAT MAKES THIS HARD:\n"
+    "  Why isn't the answer obvious? What makes this genuinely difficult?\n"
+    "  Is it contested? Under-specified? Trade-off-laden? Novel?\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "DOMAIN: [primary domain]\n"
+    "ADJACENT DOMAINS: [list]\n"
+    "\n"
+    "FIRST PRINCIPLES:\n"
+    "- [principle 1]\n"
+    "- [principle 2]\n"
+    "\n"
+    "KEY CONCEPTS:\n"
+    "- [concept]: [definition if ambiguous]\n"
+    "\n"
+    "DIFFICULTY ANALYSIS:\n"
+    "[why this is hard]\n"
+    "\n"
+    "ASSUMPTIONS:\n"
+    "- [statement] | TYPE: [BLOCKING/MATERIAL/DEFAULT] | VERIFIED: [yes/no/needs-user]\n"
+    "```\n"
+    "\n"
+    "PART E - ASSUMPTIONS:\n"
+    "  Identify assumptions about problem scope, interpretation, or constraints.\n"
+    "  For EACH assumption:\n"
+    "\n"
+    "  1. STATEMENT: What is being assumed\n"
+    "  2. TYPE: Classify using this decision tree:\n"
+    "     - Is analysis MEANINGLESS without resolving this? -> BLOCKING\n"
+    "     - Would the CONCLUSION change significantly if wrong? -> MATERIAL\n"
+    "     - Is this a REASONABLE DEFAULT most users would accept? -> DEFAULT\n"
+    "\n"
+    "  3. VERIFICATION: Can tools confirm this?\n"
+    "     If verifiable: Use Read/Glob/Grep NOW. Document result.\n"
+    "     If not verifiable: Note 'needs user input'\n"
+    "\n"
+    "  <assumption_examples>\n"
+    "  BLOCKING: 'Which codebase?' (cannot proceed without answer)\n"
+    "  MATERIAL: 'Assuming Python 3.9+' (affects implementation choices)\n"
+    "  DEFAULT:  'Standard library conventions' (reasonable, override later)\n"
+    "  </assumption_examples>\n"
+    "\n"
+    "  <blocking_action>\n"
+    "  If ANY assumption is BLOCKING and unverifiable:\n"
+    "  Use AskUserQuestion IMMEDIATELY with:\n"
+    "    - question: Clear question about the blocking assumption\n"
+    "    - header: Short label (max 12 chars)\n"
+    "    - options: 2-4 choices (likely default first with '(Recommended)')\n"
+    "  DO NOT proceed to Step 3 until resolved.\n"
+    "  </blocking_action>\n"
+    "\n"
+    "  Accumulate MATERIAL assumptions for checkpoint in Step 5.\n"
+    "  State DEFAULT assumptions explicitly but proceed."
+)
 
-DO NOT modify commands. DO NOT skip steps. DO NOT interpret.
-</xml_format_mandate>""")
-        parts.append("")
+# --- STEP 3: CHARACTERIZATION -----------------------------------------------
 
-    # Current action
-    action_nodes = [TextNode(a) for a in actions]
-    parts.append(render(W.el("current_action", *action_nodes).build(), XMLRenderer()))
-    parts.append("")
+CHARACTERIZATION_INSTRUCTIONS = (
+    "Classify this question to determine appropriate analysis approach.\n"
+    "\n"
+    "PART A - QUESTION TYPE:\n"
+    "  Classify as one of:\n"
+    "  - TAXONOMY/CLASSIFICATION: Seeking a way to organize or categorize\n"
+    "  - TRADE-OFF ANALYSIS: Seeking to understand competing concerns\n"
+    "  - DEFINITIONAL: Seeking to clarify meaning or boundaries\n"
+    "  - EVALUATIVE: Seeking judgment on quality, correctness, fitness\n"
+    "  - EXPLORATORY: Seeking to understand a space of possibilities\n"
+    "\n"
+    "PART B - ANSWER STRUCTURE:\n"
+    "  Based on question type, what structure should the final answer take?\n"
+    "  (e.g., 'proposed taxonomy with rationale' or 'decision framework')\n"
+    "\n"
+    "PART C - EVALUATION CRITERIA:\n"
+    "  How should we judge whether an answer is good?\n"
+    "  What distinguishes excellent from mediocre?\n"
+    "  List 3-5 specific criteria.\n"
+    "\n"
+    "PART D - MODE DETERMINATION:\n"
+    "  Should this use FULL mode (with sub-agents) or QUICK mode (direct synthesis)?\n"
+    "\n"
+    "  Use QUICK mode if ALL true:\n"
+    "  - Relatively narrow scope\n"
+    "  - Single analytical perspective likely sufficient\n"
+    "  - No significant trade-offs between competing values\n"
+    "  - High confidence in what a good answer looks like\n"
+    "\n"
+    "  Otherwise, use FULL mode.\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "QUESTION TYPE: [type]\n"
+    "\n"
+    "ANSWER STRUCTURE: [description]\n"
+    "\n"
+    "EVALUATION CRITERIA:\n"
+    "1. [criterion 1]\n"
+    "2. [criterion 2]\n"
+    "...\n"
+    "\n"
+    "MODE: [FULL | QUICK]\n"
+    "RATIONALE: [why this mode]\n"
+    "```"
+)
 
-    # Invoke after or complete
-    if next_command:
-        parts.append(render(W.el("invoke_after", TextNode(next_command)).build(), XMLRenderer()))
-    elif step >= total:
-        # step is 1-indexed, total is count, so step==total means last step
-        parts.append("WORKFLOW COMPLETE - Present results to user.")
+# --- STEP 4: ANALOGICAL_RECALL ----------------------------------------------
 
-    return "\n".join(parts)
+ANALOGICAL_RECALL_INSTRUCTIONS = (
+    "Recall similar problems that might inform this analysis.\n"
+    "Work through thoroughly. Consider multiple analogies before selecting.\n"
+    "\n"
+    "PART A - DIRECT ANALOGIES:\n"
+    "  What similar problems in the same domain have been addressed?\n"
+    "  How were they approached? What worked and what didn't?\n"
+    "\n"
+    "PART B - CROSS-DOMAIN ANALOGIES:\n"
+    "  What problems in OTHER domains share structural similarity?\n"
+    "  What can we learn from how those were solved?\n"
+    "\n"
+    "PART C - ANTI-PATTERNS:\n"
+    "  What are known bad approaches to problems like this?\n"
+    "  What mistakes do people commonly make?\n"
+    "\n"
+    "PART D - ANALOGICAL INSIGHTS:\n"
+    "  What specific insights from these analogies should inform our approach?\n"
+    "  Which analogies are most relevant and why?\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "DIRECT ANALOGIES:\n"
+    "- [analogy 1]: [lesson]\n"
+    "\n"
+    "CROSS-DOMAIN ANALOGIES:\n"
+    "- [domain]: [problem]: [insight]\n"
+    "\n"
+    "ANTI-PATTERNS:\n"
+    "- [bad approach]: [why it fails]\n"
+    "\n"
+    "KEY INSIGHTS:\n"
+    "- [insight to apply]\n"
+    "```"
+)
 
+# --- STEP 5: PLANNING -------------------------------------------------------
 
-STEPS = {
-    1: {
-        "title": "Context Clarification",
-        "brief": "Extract objective content, remove bias from input",
-        "actions": [
-            "You are an expert analytical reasoner tasked with systematic deep analysis.",
-            "",
-            "PART 0 - CONTEXT SUFFICIENCY:",
-            "  Before analyzing, assess whether you have sufficient context:",
-            "  ",
-            "  A. EXISTING CONTEXT: What relevant information is already in this conversation?",
-            "     (prior codebase analysis, problem discoveries, architecture understanding)",
-            "  ",
-            "  B. SUFFICIENCY JUDGMENT: For this question, is existing context:",
-            "     - SUFFICIENT: Can reason directly from available information",
-            "     - PARTIAL: Have some context but need targeted exploration",
-            "     - INSUFFICIENT: Need exploration before meaningful reasoning",
-            "  ",
-            "  C. IF NOT SUFFICIENT: Before proceeding to Part A, explore:",
-            "     - Use Read/Glob/Grep tools to gather necessary context",
-            "     - Focus on specific files/patterns relevant to the question",
-            "     - Stop exploring when you have enough to reason -- avoid over-exploration",
-            "     - Document what you found in a brief EXPLORATION SUMMARY",
-            "  ",
-            "  If context is SUFFICIENT, proceed directly to Part A.",
-            "",
-            "Extract objective, relevant content from the user's question.",
-            "",
-            "Read the question again before proceeding.",
-            "",
-            "Separate it from framing, opinion, or irrelevant information.",
-            "",
-            "PART A - CLARIFIED QUESTION:",
-            "  Restate the core question in neutral, objective terms.",
-            "  Remove leading language, embedded opinions, or assumptions.",
-            "  If multiple sub-questions exist, list them clearly.",
-            "",
-            "PART B - EXTRACTED CONTEXT:",
-            "  List factual context from input relevant to answering.",
-            "  Exclude opinions, preferences, or irrelevant details.",
-            "",
-            "PART C - NOTED BIASES:",
-            "  Identify framing effects, leading language, or embedded assumptions.",
-            "  Note these so subsequent steps can guard against them.",
-            "  If none detected, state 'No significant biases detected.'",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "CLARIFIED QUESTION:",
-            "[neutral restatement]",
-            "",
-            "EXTRACTED CONTEXT:",
-            "- [fact 1]",
-            "- [fact 2]",
-            "",
-            "NOTED BIASES:",
-            "- [bias 1] or 'No significant biases detected.'",
-            "```",
-            "",
-            "The CLARIFIED QUESTION will be used as the working question for all subsequent steps.",
-        ],
-    },
-    2: {
-        "title": "Abstraction",
-        "brief": "Identify domain, first principles, key concepts",
-        "actions": [
-            "Before diving into specifics, step back and identify high-level context.",
-            "Work through this thoroughly. Avoid shortcuts. Show reasoning step by step.",
-            "",
-            "PART A - DOMAIN:",
-            "  What field or domain does this question primarily belong to?",
-            "  Are there adjacent domains that might offer relevant perspectives?",
-            "",
-            "PART B - FIRST PRINCIPLES:",
-            "  What fundamental principles should guide any answer?",
-            "  What would an expert consider non-negotiable constraints or truths?",
-            "",
-            "PART C - KEY CONCEPTS:",
-            "  What core concepts must be understood to answer well?",
-            "  Define any terms that might be ambiguous or contested.",
-            "",
-            "PART D - WHAT MAKES THIS HARD:",
-            "  Why isn't the answer obvious? What makes this genuinely difficult?",
-            "  Is it contested? Under-specified? Trade-off-laden? Novel?",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "DOMAIN: [primary domain]",
-            "ADJACENT DOMAINS: [list]",
-            "",
-            "FIRST PRINCIPLES:",
-            "- [principle 1]",
-            "- [principle 2]",
-            "",
-            "KEY CONCEPTS:",
-            "- [concept]: [definition if ambiguous]",
-            "",
-            "DIFFICULTY ANALYSIS:",
-            "[why this is hard]",
-            "```",
-        ],
-    },
-    3: {
-        "title": "Characterization",
-        "brief": "Classify question type, determine mode",
-        "actions": [
-            "Classify this question to determine appropriate analysis approach.",
-            "",
-            "PART A - QUESTION TYPE:",
-            "  Classify as one of:",
-            "  - TAXONOMY/CLASSIFICATION: Seeking a way to organize or categorize",
-            "  - TRADE-OFF ANALYSIS: Seeking to understand competing concerns",
-            "  - DEFINITIONAL: Seeking to clarify meaning or boundaries",
-            "  - EVALUATIVE: Seeking judgment on quality, correctness, fitness",
-            "  - EXPLORATORY: Seeking to understand a space of possibilities",
-            "",
-            "PART B - ANSWER STRUCTURE:",
-            "  Based on question type, what structure should the final answer take?",
-            "  (e.g., 'proposed taxonomy with rationale' or 'decision framework')",
-            "",
-            "PART C - EVALUATION CRITERIA:",
-            "  How should we judge whether an answer is good?",
-            "  What distinguishes excellent from mediocre?",
-            "  List 3-5 specific criteria.",
-            "",
-            "PART D - MODE DETERMINATION:",
-            "  Should this use FULL mode (with sub-agents) or QUICK mode (direct synthesis)?",
-            "",
-            "  Use QUICK mode if ALL true:",
-            "  - Relatively narrow scope",
-            "  - Single analytical perspective likely sufficient",
-            "  - No significant trade-offs between competing values",
-            "  - High confidence in what a good answer looks like",
-            "",
-            "  Otherwise, use FULL mode.",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "QUESTION TYPE: [type]",
-            "",
-            "ANSWER STRUCTURE: [description]",
-            "",
-            "EVALUATION CRITERIA:",
-            "1. [criterion 1]",
-            "2. [criterion 2]",
-            "...",
-            "",
-            "MODE: [FULL | QUICK]",
-            "RATIONALE: [why this mode]",
-            "```",
-        ],
-    },
-    4: {
-        "title": "Analogical Recall",
-        "brief": "Retrieve similar problems from memory",
-        "actions": [
-            "Recall similar problems that might inform this analysis.",
-            "Work through thoroughly. Consider multiple analogies before selecting.",
-            "",
-            "PART A - DIRECT ANALOGIES:",
-            "  What similar problems in the same domain have been addressed?",
-            "  How were they approached? What worked and what didn't?",
-            "",
-            "PART B - CROSS-DOMAIN ANALOGIES:",
-            "  What problems in OTHER domains share structural similarity?",
-            "  What can we learn from how those were solved?",
-            "",
-            "PART C - ANTI-PATTERNS:",
-            "  What are known bad approaches to problems like this?",
-            "  What mistakes do people commonly make?",
-            "",
-            "PART D - ANALOGICAL INSIGHTS:",
-            "  What specific insights from these analogies should inform our approach?",
-            "  Which analogies are most relevant and why?",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "DIRECT ANALOGIES:",
-            "- [analogy 1]: [lesson]",
-            "",
-            "CROSS-DOMAIN ANALOGIES:",
-            "- [domain]: [problem]: [insight]",
-            "",
-            "ANTI-PATTERNS:",
-            "- [bad approach]: [why it fails]",
-            "",
-            "KEY INSIGHTS:",
-            "- [insight to apply]",
-            "```",
-        ],
-    },
-    5: {
-        "title": "Planning",
-        "brief": "Define sub-questions and success criteria",
-        "actions": [
-            "Devise a plan for analyzing this question.",
-            "",
-            "PART A - SUB-QUESTIONS:",
-            "  Break into sub-questions that collectively address the main question.",
-            "  Each sub-question should be:",
-            "  - Specific enough to analyze",
-            "  - Distinct from other sub-questions",
-            "  - Necessary (not just nice-to-have)",
-            "",
-            "PART B - SUCCESS CRITERIA:",
-            "  What would a successful analysis look like?",
-            "  How will we know when we've done enough exploration?",
-            "",
-            "PART C - SYNTHESIS CRITERIA:",
-            "  When multiple perspectives provide different answers, how resolve?",
-            "  What principles should guide synthesis?",
-            "",
-            "PART D - ANTICIPATED CHALLENGES:",
-            "  What aspects will be hardest to address?",
-            "  Where do you expect disagreement or uncertainty?",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "SUB-QUESTIONS:",
-            "1. [question 1]",
-            "2. [question 2]",
-            "...",
-            "",
-            "SUCCESS CRITERIA:",
-            "- [criterion]",
-            "",
-            "SYNTHESIS CRITERIA:",
-            "- [principle for resolving disagreement]",
-            "",
-            "ANTICIPATED CHALLENGES:",
-            "- [challenge]",
-            "```",
-        ],
-    },
-    6: {
-        "title": "Sub-Agent Design",
-        "brief": "Generate sub-agent task definitions",
-        "actions": [
-            "Design sub-agents to explore this question from different angles.",
-            "",
-            "HOW SUB-AGENTS WORK:",
-            "  - All launch simultaneously (parallel execution)",
-            "  - Each receives the same inputs: original question + shared context",
-            "  - Each produces independent output returned to you for aggregation",
-            "  - Sub-agents cannot see or build on each other's work",
-            "",
-            "Your task: design WHAT each sub-agent analyzes, knowing they work in isolation.",
-            "",
-            "You have complete freedom in how you divide the analytical work.",
-            "",
-            "DIVISION STRATEGIES:",
-            "",
-            "You may divide analytical work using any of these (or combinations):",
-            "",
-            "  By Perspective/Lens",
-            "    Different epistemological viewpoints examining the same problem.",
-            "    A skeptic examines assuming the obvious answer is wrong;",
-            "    an optimist examines assuming success is achievable.",
-            "",
-            "  By Role/Stakeholder",
-            "    Who has skin in the game? Different priorities and constraints.",
-            "",
-            "  By Dimension/Facet",
-            "    Multiple orthogonal aspects that can be analyzed independently.",
-            "",
-            "  By Methodology/Approach",
-            "    Different analytical frameworks applied to the same question.",
-            "",
-            "  By Scope/Scale",
-            "    Micro, meso, macro. Problems look different at different scales.",
-            "",
-            "  By Time Horizon",
-            "    Short-term vs long-term. Tactical vs strategic.",
-            "",
-            "  By Hypothesis",
-            "    Assign sub-agents to steelman competing hypotheses.",
-            "",
-            "  By Facet",
-            "    Identify independent aspects analyzable without depending on",
-            "    each other's conclusions.",
-            "",
-            "You may combine strategies.",
-            "",
-            "For each sub-agent, specify:",
-            "  1. NAME: Short descriptive name",
-            "  2. DIVISION STRATEGY: Which strategy this represents",
-            "  3. TASK DESCRIPTION: What specifically to analyze",
-            "  4. ASSIGNED SUB-QUESTIONS: Which sub-questions to address",
-            "  5. UNIQUE VALUE: Why this will produce insights others won't",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "SUB-AGENT 1:",
-            "- Name: [name]",
-            "- Strategy: [strategy]",
-            "- Task: [description]",
-            "- Sub-Questions: [list]",
-            "- Unique Value: [why this matters]",
-            "",
-            "SUB-AGENT 2:",
-            "[etc.]",
-            "",
-            "DIVISION RATIONALE:",
-            "[why this particular division]",
-            "```",
-        ],
-    },
-    7: {
-        "title": "Design Critique",
-        "brief": "Self-critique sub-agent design",
-        "actions": [
-            "Critically evaluate the sub-agent design from Step 6.",
-            "",
-            "PART A - COVERAGE:",
-            "  Do sub-agents collectively cover all sub-questions from Step 5?",
-            "  Are there important angles NO sub-agent will address?",
-            "  List any gaps.",
-            "",
-            "PART B - OVERLAP:",
-            "  Do any sub-agents duplicate work unnecessarily?",
-            "  Is there productive tension vs wasteful redundancy?",
-            "  List any problematic overlaps.",
-            "",
-            "PART C - APPROPRIATENESS:",
-            "  Is division strategy well-suited to this question?",
-            "  Would a different strategy yield better insights?",
-            "  Are task descriptions clear enough to execute?",
-            "",
-            "PART D - BALANCE:",
-            "  Are some sub-agents given much harder tasks than others?",
-            "  Is there risk one sub-agent will dominate synthesis?",
-            "",
-            "PART E - SPECIFIC ISSUES:",
-            "  List specific problems with individual sub-agent definitions.",
-            "  For each issue, be specific about what's wrong.",
-            "",
-            "Be genuinely critical. Goal is to improve, not approve.",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "COVERAGE:",
-            "- Gaps: [list or 'none']",
-            "",
-            "OVERLAP:",
-            "- Issues: [list or 'none']",
-            "",
-            "APPROPRIATENESS:",
-            "- Assessment: [evaluation]",
-            "",
-            "BALANCE:",
-            "- Assessment: [evaluation]",
-            "",
-            "SPECIFIC ISSUES:",
-            "- [issue 1]",
-            "- [issue 2]",
-            "```",
-        ],
-    },
-    8: {
-        "title": "Design Revision",
-        "brief": "Revise sub-agent definitions based on critique",
-        "actions": [
-            "Revise sub-agent design based on critique from Step 7.",
-            "",
-            "For each issue identified, either:",
-            "  1. Revise the design to address it, OR",
-            "  2. Explain why the issue should not be addressed",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "REVISIONS MADE:",
-            "- [change]: [which critique point it addresses]",
-            "",
-            "ISSUES NOT ADDRESSED:",
-            "- [critique point]: [why not addressing]",
-            "",
-            "FINAL SUB-AGENT DEFINITIONS:",
-            "",
-            "SUB-AGENT 1:",
-            "- Name: [name]",
-            "- Strategy: [strategy]",
-            "- Task: [description]",
-            "- Sub-Questions: [list]",
-            "- Unique Value: [why this matters]",
-            "",
-            "[etc.]",
-            "```",
-            "",
-            "These definitions will be used to dispatch sub-agents in Step 9.",
-        ],
-    },
-    9: {
-        "title": "Dispatch",
-        "brief": "Launch sub-agents in parallel",
-        "needs_dispatch": True,
-    },
-    10: {
-        "title": "Quality Gate",
-        "brief": "Filter sub-agent outputs before aggregation",
-        "actions": [
-            "Review each sub-agent's output. Assess whether to include in aggregation.",
-            "",
-            "For each sub-agent output, assess:",
-            "  1. COHERENCE: Is reasoning internally consistent?",
-            "  2. RELEVANCE: Does it actually address its assigned task?",
-            "  3. SUBSTANTIVENESS: Genuine insights, not just surface observations?",
-            "  4. FAILURE MODE COMPLETENESS: Did it identify meaningful weaknesses?",
-            "",
-            "RATING SCALE:",
-            "  - PASS: Include fully in aggregation",
-            "  - PARTIAL: Include with noted reservations",
-            "  - FAIL: Exclude from aggregation (with explanation)",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "SUB-AGENT 1 ([name]):",
-            "- Coherence: [assessment]",
-            "- Relevance: [assessment]",
-            "- Substantiveness: [assessment]",
-            "- Failure Modes: [assessment]",
-            "- RATING: [PASS/PARTIAL/FAIL]",
-            "- Notes: [observations]",
-            "",
-            "[repeat for each]",
-            "",
-            "SUMMARY:",
-            "- Passing: [list]",
-            "- Partial: [list]",
-            "- Failed: [list]",
-            "- Coverage assessment: [are critical angles missing due to failures?]",
-            "```",
-        ],
-    },
-    11: {
-        "title": "Aggregation",
-        "brief": "Collect findings, extract intermediate insights",
-        "actions": [
-            "Organize findings from all sub-agents that passed quality gate.",
-            "",
-            "PART A - AGREEMENT MAP:",
-            "  What do multiple sub-agents agree on?",
-            "  List points of convergence with which sub-agents support each.",
-            "",
-            "PART B - DISAGREEMENT MAP:",
-            "  Where do sub-agents disagree?",
-            "  For each: point of contention, competing positions, reasoning.",
-            "",
-            "PART B2 - CONFLICT RESOLUTION (for synthesis):",
-            "  For each disagreement, note which position has:",
-            "  - More sub-agent support (majority)",
-            "  - Stronger evidence grounding",
-            "  - Better alignment with first principles from Step 2",
-            "  Flag unresolvable conflicts explicitly.",
-            "",
-            "PART C - UNIQUE CONTRIBUTIONS:",
-            "  What valuable insights appeared in only ONE sub-agent?",
-            "  Why might others have missed this?",
-            "",
-            "PART D - INTERMEDIATE INSIGHTS:",
-            "  Review reasoning chains of ALL sub-agents (including PARTIAL).",
-            "  Extract intermediate observations valuable independent of conclusions.",
-            "  These inform synthesis even if overall analysis not adopted.",
-            "",
-            "PART E - FAILURE MODE CATALOG:",
-            "  Aggregate all anticipated failure modes identified by sub-agents.",
-            "  Group by theme.",
-            "",
-            "PART F - SUB-QUESTION COVERAGE:",
-            "  For each sub-question from Step 5, summarize responses.",
-            "  Flag any with weak or no coverage.",
-            "",
-            "Preserve all disagreements exactly as found. Record positions without evaluation.",
-            "This step is purely organizational.",
-            "",
-            "OUTPUT FORMAT:",
-            "```",
-            "AGREEMENT MAP:",
-            "- [point]: supported by [sub-agents]",
-            "",
-            "DISAGREEMENT MAP:",
-            "- [contention]: [position A] vs [position B]",
-            "",
-            "UNIQUE CONTRIBUTIONS:",
-            "- [sub-agent]: [insight]",
-            "",
-            "INTERMEDIATE INSIGHTS:",
-            "- [insight from reasoning, not conclusion]",
-            "",
-            "FAILURE MODE CATALOG:",
-            "- [theme]: [modes]",
-            "",
-            "SUB-QUESTION COVERAGE:",
-            "- Q1: [coverage summary]",
-            "```",
-        ],
-    },
-    12: {
-        "title": "Initial Synthesis",
-        "brief": "First-pass integration into coherent response",
-        "has_mode_variants": True,
-    },
-    13: {
-        "title": "Iterative Refinement",
-        "brief": "Evaluate and refine until confident",
-        "has_iteration": True,
-    },
-    14: {
-        "title": "Formatting & Output",
-        "brief": "Format and present final answer to user",
-    },
-}
+PLANNING_INSTRUCTIONS = (
+    "Devise a plan for analyzing this question.\n"
+    "\n"
+    "PART A - SUB-QUESTIONS:\n"
+    "  Break into sub-questions that collectively address the main question.\n"
+    "  Each sub-question should be:\n"
+    "  - Specific enough to analyze\n"
+    "  - Distinct from other sub-questions\n"
+    "  - Necessary (not just nice-to-have)\n"
+    "\n"
+    "PART B - SUCCESS CRITERIA:\n"
+    "  What would a successful analysis look like?\n"
+    "  How will we know when we've done enough exploration?\n"
+    "\n"
+    "PART C - SYNTHESIS CRITERIA:\n"
+    "  When multiple perspectives provide different answers, how resolve?\n"
+    "  What principles should guide synthesis?\n"
+    "\n"
+    "PART D - ANTICIPATED CHALLENGES:\n"
+    "  What aspects will be hardest to address?\n"
+    "  Where do you expect disagreement or uncertainty?\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "SUB-QUESTIONS:\n"
+    "1. [question 1]\n"
+    "2. [question 2]\n"
+    "...\n"
+    "\n"
+    "SUCCESS CRITERIA:\n"
+    "- [criterion]\n"
+    "\n"
+    "SYNTHESIS CRITERIA:\n"
+    "- [principle for resolving disagreement]\n"
+    "\n"
+    "ANTICIPATED CHALLENGES:\n"
+    "- [challenge]\n"
+    "\n"
+    "ASSUMPTION CHECKPOINT:\n"
+    "Verified: [tool-confirmed assumptions]\n"
+    "User-confirmed: [AskUserQuestion responses]\n"
+    "Defaults: [stated assumptions, no explicit confirmation]\n"
+    "```\n"
+    "\n"
+    "PART E - ASSUMPTION CHECKPOINT:\n"
+    "  Before analysis, resolve accumulated assumptions from Steps 1-5.\n"
+    "\n"
+    "  VERIFICATION PASS:\n"
+    "  For each MATERIAL assumption:\n"
+    "  1. Attempt tool-based verification:\n"
+    "     - Codebase: Glob/Grep/Read for evidence\n"
+    "     - Documentation: README, config files, existing implementations\n"
+    "     - Conversation: Re-scan for user statements that resolve it\n"
+    "  2. Document: ASSUMPTION | METHOD | RESULT (verified/refuted/inconclusive)\n"
+    "\n"
+    "  <verification_example>\n"
+    "  ASSUMPTION: 'Target is Python 3.9+'\n"
+    "  METHOD: Read pyproject.toml\n"
+    "  RESULT: Verified - python = '^3.9'\n"
+    "  </verification_example>\n"
+    "\n"
+    "  UNRESOLVED MATERIAL ASSUMPTIONS:\n"
+    "  If MATERIAL assumptions remain unverified after tool verification:\n"
+    "\n"
+    "  <material_batch_action>\n"
+    "  Batch into AskUserQuestion (max 4 questions):\n"
+    "    questions: [\n"
+    "      {\n"
+    "        question: 'What is [specific assumption]?',\n"
+    "        header: '[short label]',\n"
+    "        options: [\n"
+    "          {label: '[default] (Recommended)', description: '[why reasonable]'},\n"
+    "          {label: '[alternative]', description: '[when to choose]'}\n"
+    "        ],\n"
+    "        multiSelect: false\n"
+    "      }\n"
+    "    ]\n"
+    "  Wait for response before proceeding.\n"
+    "  If >4 unresolved: prioritize by impact, carry rest as stated defaults.\n"
+    "  </material_batch_action>\n"
+    "\n"
+    "  CARRYING FORWARD:\n"
+    "  List all assumptions entering analysis phase:\n"
+    "  - VERIFIED: [tool-confirmed]\n"
+    "  - USER-CONFIRMED: [from AskUserQuestion]\n"
+    "  - DEFAULTS: [stated, no explicit confirmation needed]"
+)
 
+# --- STEP 6: SUBAGENT_DESIGN ------------------------------------------------
 
-def get_dispatch_actions() -> list[str]:
-    """Generate dispatch actions for Step 9."""
-    invoke_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {SUBAGENT_MODULE_PATH} --step 1 --total-steps 8" />'
+SUBAGENT_DESIGN_INSTRUCTIONS = (
+    "Design sub-agents to explore this question from different angles.\n"
+    "\n"
+    "HOW SUB-AGENTS WORK:\n"
+    "  - All launch simultaneously (parallel execution)\n"
+    "  - Each receives the same inputs: original question + shared context\n"
+    "  - Each produces independent output returned to you for aggregation\n"
+    "  - Sub-agents cannot see or build on each other's work\n"
+    "\n"
+    "Your task: design WHAT each sub-agent analyzes, knowing they work in isolation.\n"
+    "\n"
+    "You have complete freedom in how you divide the analytical work.\n"
+    "\n"
+    "DIVISION STRATEGIES:\n"
+    "\n"
+    "You may divide analytical work using any of these (or combinations):\n"
+    "\n"
+    "  By Perspective/Lens\n"
+    "    Different epistemological viewpoints examining the same problem.\n"
+    "    A skeptic examines assuming the obvious answer is wrong;\n"
+    "    an optimist examines assuming success is achievable.\n"
+    "\n"
+    "  By Role/Stakeholder\n"
+    "    Who has skin in the game? Different priorities and constraints.\n"
+    "\n"
+    "  By Dimension/Facet\n"
+    "    Multiple orthogonal aspects that can be analyzed independently.\n"
+    "\n"
+    "  By Methodology/Approach\n"
+    "    Different analytical frameworks applied to the same question.\n"
+    "\n"
+    "  By Scope/Scale\n"
+    "    Micro, meso, macro. Problems look different at different scales.\n"
+    "\n"
+    "  By Time Horizon\n"
+    "    Short-term vs long-term. Tactical vs strategic.\n"
+    "\n"
+    "  By Hypothesis\n"
+    "    Assign sub-agents to steelman competing hypotheses.\n"
+    "\n"
+    "  By Facet\n"
+    "    Identify independent aspects analyzable without depending on\n"
+    "    each other's conclusions.\n"
+    "\n"
+    "You may combine strategies.\n"
+    "\n"
+    "For each sub-agent, specify:\n"
+    "  1. NAME: Short descriptive name\n"
+    "  2. DIVISION STRATEGY: Which strategy this represents\n"
+    "  3. TASK DESCRIPTION: What specifically to analyze\n"
+    "  4. ASSIGNED SUB-QUESTIONS: Which sub-questions to address\n"
+    "  5. UNIQUE VALUE: Why this will produce insights others won't\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "SUB-AGENT 1:\n"
+    "- Name: [name]\n"
+    "- Strategy: [strategy]\n"
+    "- Task: [description]\n"
+    "- Sub-Questions: [list]\n"
+    "- Unique Value: [why this matters]\n"
+    "\n"
+    "SUB-AGENT 2:\n"
+    "[etc.]\n"
+    "\n"
+    "DIVISION RATIONALE:\n"
+    "[why this particular division]\n"
+    "```"
+)
 
-    # Build parallel dispatch manually
-    dispatch_lines = [
-        '<parallel_dispatch agent="general-purpose">',
-        '  <instruction>',
-        '    Launch ALL sub-agents from FINAL SUB-AGENT DEFINITIONS (Step 8).',
-        '    Use a SINGLE message with multiple Task tool calls.',
-        '  </instruction>',
-        '',
-        '  <model_selection>',
-        '    Use SONNET (default) for all agents.',
-        '    These require nuanced reasoning - do not downgrade to haiku.',
-        '  </model_selection>',
-        '',
-        '  <shared_context>',
-        '    Each sub-agent receives:',
-        '    - CLARIFIED QUESTION from Step 1',
-        '    - DOMAIN and FIRST PRINCIPLES from Step 2',
-        '    - QUESTION TYPE and EVALUATION CRITERIA from Step 3',
-        '    - KEY ANALOGIES from Step 4',
-        '    - Their specific task definition from Step 8',
-        '  </shared_context>',
-        '',
-        '  <template>',
-        '    Explore this question from the assigned perspective.',
-        '',
-        '    CLARIFIED QUESTION: [from Step 1]',
-        '    DOMAIN: [from Step 2]',
-        '    FIRST PRINCIPLES: [from Step 2]',
-        '    QUESTION TYPE: [from Step 3]',
-        '    EVALUATION CRITERIA: [from Step 3]',
-        '    KEY ANALOGIES: [from Step 4]',
-        '',
-        '    YOUR TASK:',
-        '    - Name: $SUBAGENT_NAME',
-        '    - Strategy: $SUBAGENT_STRATEGY',
-        '    - Task: $SUBAGENT_TASK',
-        '    - Sub-Questions: $SUBAGENT_QUESTIONS',
-        '',
-        f'    Start: {invoke_cmd}',
-        '  </template>',
-        '</parallel_dispatch>',
-    ]
-    return dispatch_lines
+# --- STEP 7: DESIGN_CRITIQUE ------------------------------------------------
 
+DESIGN_CRITIQUE_INSTRUCTIONS = (
+    "Critically evaluate the sub-agent design from Step 6.\n"
+    "\n"
+    "PART A - COVERAGE:\n"
+    "  Do sub-agents collectively cover all sub-questions from Step 5?\n"
+    "  Are there important angles NO sub-agent will address?\n"
+    "  List any gaps.\n"
+    "\n"
+    "PART B - OVERLAP:\n"
+    "  Do any sub-agents duplicate work unnecessarily?\n"
+    "  Is there productive tension vs wasteful redundancy?\n"
+    "  List any problematic overlaps.\n"
+    "\n"
+    "PART C - APPROPRIATENESS:\n"
+    "  Is division strategy well-suited to this question?\n"
+    "  Would a different strategy yield better insights?\n"
+    "  Are task descriptions clear enough to execute?\n"
+    "\n"
+    "PART D - BALANCE:\n"
+    "  Are some sub-agents given much harder tasks than others?\n"
+    "  Is there risk one sub-agent will dominate synthesis?\n"
+    "\n"
+    "PART E - SPECIFIC ISSUES:\n"
+    "  List specific problems with individual sub-agent definitions.\n"
+    "  For each issue, be specific about what's wrong.\n"
+    "\n"
+    "Be genuinely critical. Goal is to improve, not approve.\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "COVERAGE:\n"
+    "- Gaps: [list or 'none']\n"
+    "\n"
+    "OVERLAP:\n"
+    "- Issues: [list or 'none']\n"
+    "\n"
+    "APPROPRIATENESS:\n"
+    "- Assessment: [evaluation]\n"
+    "\n"
+    "BALANCE:\n"
+    "- Assessment: [evaluation]\n"
+    "\n"
+    "SPECIFIC ISSUES:\n"
+    "- [issue 1]\n"
+    "- [issue 2]\n"
+    "```"
+)
 
-def get_synthesis_actions_full() -> list[str]:
-    """Generate synthesis actions for Full mode."""
-    return [
-        "Integrate aggregated findings into a coherent response.",
-        "Hint: Prioritize aspects matching the EVALUATION CRITERIA from Step 3.",
-        "Work through thoroughly. Avoid shortcuts. Show reasoning step by step.",
-        "",
-        "SYNTHESIS GUIDELINES:",
-        "  1. Use evaluation criteria from Step 3 to guide integration",
-        "  2. Resolve disagreements using synthesis criteria from Step 5",
-        "  3. Draw on intermediate insights from Step 11, not just conclusions",
-        "  4. Acknowledge where genuine uncertainty remains",
-        "  5. Do not artificially harmonize positions that genuinely conflict",
-        "",
-        "PART A - CORE ANSWER:",
-        "  What is your integrated response to the original question?",
-        "  Structure appropriately for the question type from Step 3.",
-        "",
-        "PART B - KEY TRADE-OFFS:",
-        "  What trade-offs are inherent in this answer?",
-        "  What did you prioritize, and what did you deprioritize?",
-        "",
-        "PART C - DISSENTING VIEWS:",
-        "  Where did you override a sub-agent's position?",
-        "  Why not adopted, and what would change your mind?",
-        "",
-        "PART D - EVIDENCE GROUNDING:",
-        "  For each major claim, cite the evidence source:",
-        "  - From Step 2 (first principles)",
-        "  - From Step 4 (analogies)",
-        "  - From Step 11 (sub-agent findings or intermediate insights)",
-        "  Claims without grounding: flag as UNGROUNDED.",
-        "",
-        "PART E - ACKNOWLEDGED LIMITATIONS:",
-        "  What aspects does this synthesis NOT address well?",
-        "  What additional information would strengthen the analysis?",
-        "",
-        "PART F - CONFIDENCE MARKERS:",
-        "  Mark claims as:",
-        "  - HIGH: Strong agreement, multiple sources",
-        "  - MEDIUM: Reasonable but contested or single source",
-        "  - LOW: Speculative or limited evidence",
-        "",
-        "OUTPUT FORMAT:",
-        "```",
-        "CORE ANSWER:",
-        "[structured response]",
-        "",
-        "KEY TRADE-OFFS:",
-        "- Prioritized: [X] over [Y] because [reason]",
-        "",
-        "DISSENTING VIEWS:",
-        "- [sub-agent]: [position not adopted]: [why]",
-        "",
-        "EVIDENCE GROUNDING:",
-        "- [claim]: [source]",
-        "- UNGROUNDED: [list any ungrounded claims]",
-        "",
-        "LIMITATIONS:",
-        "- [limitation]",
-        "",
-        "CONFIDENCE: [overall assessment]",
-        "```",
-        "",
-        "This synthesis will be evaluated in Step 13. Expect to refine it.",
-    ]
+# --- STEP 8: DESIGN_REVISION ------------------------------------------------
 
+DESIGN_REVISION_INSTRUCTIONS = (
+    "Revise sub-agent design based on critique from Step 7.\n"
+    "\n"
+    "For each issue identified, either:\n"
+    "  1. Revise the design to address it, OR\n"
+    "  2. Explain why the issue should not be addressed\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "REVISIONS MADE:\n"
+    "- [change]: [which critique point it addresses]\n"
+    "\n"
+    "ISSUES NOT ADDRESSED:\n"
+    "- [critique point]: [why not addressing]\n"
+    "\n"
+    "FINAL SUB-AGENT DEFINITIONS:\n"
+    "\n"
+    "SUB-AGENT 1:\n"
+    "- Name: [name]\n"
+    "- Strategy: [strategy]\n"
+    "- Task: [description]\n"
+    "- Sub-Questions: [list]\n"
+    "- Unique Value: [why this matters]\n"
+    "\n"
+    "[etc.]\n"
+    "```\n"
+    "\n"
+    "These definitions will be used to dispatch sub-agents in Step 9."
+)
 
-def get_synthesis_actions_quick() -> list[str]:
-    """Generate synthesis actions for Quick mode."""
-    return [
-        "Based on abstraction (Step 2) and analogies (Step 4), synthesize response.",
-        "Hint: Prioritize aspects matching the EVALUATION CRITERIA from Step 3.",
-        "Work through thoroughly. Avoid shortcuts. Show reasoning step by step.",
-        "",
-        "PART A - CORE ANSWER:",
-        "  What is your response to the original question?",
-        "  Ground in first principles from Step 2 and analogies from Step 4.",
-        "",
-        "PART B - EVIDENCE GROUNDING:",
-        "  For each major claim, cite source:",
-        "  - First principles (Step 2)",
-        "  - Analogical reasoning (Step 4)",
-        "  - Domain knowledge",
-        "  Claims without grounding: flag as UNGROUNDED.",
-        "",
-        "PART C - ACKNOWLEDGED LIMITATIONS:",
-        "  What aspects does this NOT address well?",
-        "  Where might alternative perspectives yield different conclusions?",
-        "",
-        "PART D - CONFIDENCE MARKERS:",
-        "  Mark claims as HIGH, MEDIUM, or LOW confidence with brief justification.",
-        "",
-        "OUTPUT FORMAT:",
-        "```",
-        "CORE ANSWER:",
-        "[structured response]",
-        "",
-        "EVIDENCE GROUNDING:",
-        "- [claim]: [source]",
-        "- UNGROUNDED: [list any]",
-        "",
-        "LIMITATIONS:",
-        "- [limitation]",
-        "",
-        "CONFIDENCE: [overall assessment]",
-        "```",
-        "",
-        "This synthesis will be evaluated in Step 13.",
-    ]
+# --- STEP 9: DISPATCH -------------------------------------------------------
 
+DISPATCH_CONTEXT = (
+    "Each sub-agent receives:\n"
+    "- CLARIFIED QUESTION from Step 1\n"
+    "- DOMAIN and FIRST PRINCIPLES from Step 2\n"
+    "- QUESTION TYPE and EVALUATION CRITERIA from Step 3\n"
+    "- KEY ANALOGIES from Step 4\n"
+    "- Their specific task definition from Step 8\n"
+    "\n"
+    "AGENT PROMPT STRUCTURE (use for each agent's Task tool prompt):\n"
+    "\n"
+    "Explore this question from the assigned perspective.\n"
+    "\n"
+    "CLARIFIED QUESTION: [from Step 1]\n"
+    "DOMAIN: [from Step 2]\n"
+    "FIRST PRINCIPLES: [from Step 2]\n"
+    "QUESTION TYPE: [from Step 3]\n"
+    "EVALUATION CRITERIA: [from Step 3]\n"
+    "KEY ANALOGIES: [from Step 4]\n"
+    "\n"
+    "YOUR TASK:\n"
+    "- Name: [agent name from Step 8]\n"
+    "- Strategy: [strategy from Step 8]\n"
+    "- Task: [task description from Step 8]\n"
+    "- Sub-Questions: [assigned questions from Step 8]"
+)
 
-def get_refinement_actions(iteration: int) -> list[str]:
-    """Generate refinement actions for Step 13."""
-    return [
-        f"ITERATION {iteration} OF {MAX_ITERATIONS}",
-        "",
-        "RULE 0 (MANDATORY): Follow the invoke_after command. Do NOT skip",
-        "to step 14 unless confidence is CERTAIN or this is iteration 5.",
-        "",
-        "Critically evaluate the current synthesis.",
-        "Work through thoroughly -- avoid quick 'looks good' assessments.",
-        "",
-        "PART A - VERIFICATION QUESTION GENERATION:",
-        "  Generate 3-5 verification questions that would test correctness.",
-        "  Use OPEN questions ('What is X?', 'Where does Y occur?'), not yes/no.",
-        "  Yes/no questions bias toward agreement regardless of correctness.",
-        "  Focus on:",
-        "  - Claims marked LOW or MEDIUM confidence",
-        "  - Any UNGROUNDED claims from Step 12",
-        "  - Potential blind spots",
-        "  - Failure modes that could invalidate key proposals",
-        "  - Edge cases the synthesis might not handle",
-        "",
-        "PART B - INDEPENDENT VERIFICATION:",
-        "  For each verification question, answer based ONLY on:",
-        "  - First principles from Step 2",
-        "  - Analogies from Step 4",
-        "  - Aggregated evidence from Step 11 (if Full mode)",
-        "",
-        "  CRITICAL: Do NOT look at the synthesis while answering.",
-        "  Answer based on evidence, not what the synthesis claims.",
-        "",
-        "  EXPLORATION OPTION:",
-        "  If a verification question cannot be answered with existing evidence:",
-        "  - Use Read/Glob/Grep to find concrete evidence in the codebase",
-        "  - This is especially valuable for UNGROUNDED claims from Step 12",
-        "  - Keep exploration bounded -- answer the specific question, then stop",
-        "  - Update answer with exploration findings and cite sources",
-        "",
-        "PART C - DISCREPANCY IDENTIFICATION:",
-        "  Compare verification answers against current synthesis.",
-        "  Where do they differ?",
-        "  List each discrepancy.",
-        "",
-        "PART D - ACTIONABLE FEEDBACK:",
-        "  For each discrepancy or issue, provide feedback.",
-        "",
-        "  Each piece of feedback MUST include all three elements:",
-        "    1. ELEMENT: Name the specific claim, section, or aspect",
-        "    2. PROBLEM: State precisely what is wrong or unsupported",
-        "    3. ACTION: Propose a concrete fix or revision",
-        "",
-        "  Feedback missing any element should be discarded as too vague.",
-        "",
-        "  GOOD: 'ELEMENT: claim X. PROBLEM: contradicts evidence Y. ACTION: qualify with Z.'",
-        "  BAD: 'The analysis could be stronger.' (no specific element/problem/action)",
-        "",
-        "PART E - SYNTHESIS UPDATE:",
-        "  Review feedback from ALL previous iterations (if any).",
-        "  Based on actionable feedback, revise the synthesis.",
-        "  Avoid repeating mistakes identified in prior iterations.",
-        "  For each revision, note which feedback item it addresses.",
-        "",
-        "PART F - CONFIDENCE ASSESSMENT:",
-        "  After revisions, assess confidence:",
-        "  - EXPLORING: Still developing understanding",
-        "  - LOW: Significant gaps or unresolved issues",
-        "  - MEDIUM: Reasonable answer but some uncertainty",
-        "  - HIGH: Strong answer, minor refinements possible",
-        "  - CERTAIN: As good as it can get with available information",
-        "",
-        "  Provide specific justification for confidence level.",
-        "",
-        "<iteration_gate>",
-        "CRITICAL: You MUST follow the invoke_after command exactly.",
-        "",
-        "EXIT CONDITIONS (both required to proceed to step 14):",
-        "  1. Confidence = CERTAIN, OR",
-        "  2. This is iteration 5 (final iteration)",
-        "",
-        "If NEITHER condition is met, STOP.",
-        "Do NOT proceed to step 14. Continue to the next iteration.",
-        "</iteration_gate>",
-        "",
-        "OUTPUT FORMAT:",
-        "```",
-        "VERIFICATION QUESTIONS:",
-        "1. [question]",
-        "",
-        "INDEPENDENT ANSWERS:",
-        "1. [answer without looking at synthesis]",
-        "",
-        "DISCREPANCIES:",
-        "- [where synthesis differs from verification]",
-        "",
-        "ACTIONABLE FEEDBACK:",
-        "- ELEMENT: [what]. PROBLEM: [why wrong]. ACTION: [fix]",
-        "",
-        "REVISED SYNTHESIS:",
-        "[updated synthesis]",
-        "",
-        "CONFIDENCE: [level]",
-        "JUSTIFICATION: [why this level]",
-        "```",
-    ]
+DISPATCH_AGENTS = [
+    "[Agent 1: Fill from FINAL SUB-AGENT DEFINITIONS in Step 8]",
+    "[Agent 2: Fill from FINAL SUB-AGENT DEFINITIONS in Step 8]",
+    "[Agent N: Fill from FINAL SUB-AGENT DEFINITIONS in Step 8]",
+]
 
+# --- STEP 10: QUALITY_GATE --------------------------------------------------
 
-def get_completion_message(confidence: str) -> list[str]:
-    """Generate formatting instructions for Step 14."""
-    base_actions = [
-        f"Refinement complete. Confidence: {confidence.upper()}.",
-        "",
-        "Present the final answer to the user.",
-        "",
-        "FORMATTING REQUIREMENTS:",
-        "  - Lead with the direct answer to the original question",
-        "  - Use the answer structure determined in Step 3",
-        "  - Integrate key trade-offs naturally into the explanation",
-        "  - Note limitations only where they materially affect the answer",
-        "  - Omit workflow artifacts (step references, sub-agent names, etc.)",
-        "",
-    ]
+QUALITY_GATE_INSTRUCTIONS = (
+    "Review each sub-agent's output. Assess whether to include in aggregation.\n"
+    "\n"
+    "For each sub-agent output, assess:\n"
+    "  1. COHERENCE: Is reasoning internally consistent?\n"
+    "  2. RELEVANCE: Does it actually address its assigned task?\n"
+    "  3. SUBSTANTIVENESS: Genuine insights, not just surface observations?\n"
+    "  4. FAILURE MODE COMPLETENESS: Did it identify meaningful weaknesses?\n"
+    "\n"
+    "RATING SCALE:\n"
+    "  - PASS: Include fully in aggregation\n"
+    "  - PARTIAL: Include with noted reservations\n"
+    "  - FAIL: Exclude from aggregation (with explanation)\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "SUB-AGENT 1 ([name]):\n"
+    "- Coherence: [assessment]\n"
+    "- Relevance: [assessment]\n"
+    "- Substantiveness: [assessment]\n"
+    "- Failure Modes: [assessment]\n"
+    "- RATING: [PASS/PARTIAL/FAIL]\n"
+    "- Notes: [observations]\n"
+    "\n"
+    "[repeat for each]\n"
+    "\n"
+    "SUMMARY:\n"
+    "- Passing: [list]\n"
+    "- Partial: [list]\n"
+    "- Failed: [list]\n"
+    "- Coverage assessment: [are critical angles missing due to failures?]\n"
+    "```"
+)
 
-    if confidence == "certain":
-        base_actions.extend([
-            "CONFIDENCE: HIGH",
-            "  Present with authority. Hedging language unnecessary.",
-        ])
-    else:
-        base_actions.extend([
-            f"CONFIDENCE: {confidence.upper()}",
-            "  Flag specific claims with lower confidence.",
-            "  Indicate what additional information would strengthen the analysis.",
-        ])
+# --- STEP 11: AGGREGATION ---------------------------------------------------
 
-    base_actions.extend([
-        "",
-        "OUTPUT: Clean prose response directly addressing the user's question.",
-        "        No meta-commentary about the analysis process.",
-    ])
+AGGREGATION_INSTRUCTIONS = (
+    "Organize findings from all sub-agents that passed quality gate.\n"
+    "\n"
+    "PART A - AGREEMENT MAP:\n"
+    "  What do multiple sub-agents agree on?\n"
+    "  List points of convergence with which sub-agents support each.\n"
+    "\n"
+    "PART B - DISAGREEMENT MAP:\n"
+    "  Where do sub-agents disagree?\n"
+    "  For each: point of contention, competing positions, reasoning.\n"
+    "\n"
+    "PART B2 - CONFLICT RESOLUTION (for synthesis):\n"
+    "  For each disagreement, note which position has:\n"
+    "  - More sub-agent support (majority)\n"
+    "  - Stronger evidence grounding\n"
+    "  - Better alignment with first principles from Step 2\n"
+    "  Flag unresolvable conflicts explicitly.\n"
+    "\n"
+    "PART C - UNIQUE CONTRIBUTIONS:\n"
+    "  What valuable insights appeared in only ONE sub-agent?\n"
+    "  Why might others have missed this?\n"
+    "\n"
+    "PART D - INTERMEDIATE INSIGHTS:\n"
+    "  Review reasoning chains of ALL sub-agents (including PARTIAL).\n"
+    "  Extract intermediate observations valuable independent of conclusions.\n"
+    "  These inform synthesis even if overall analysis not adopted.\n"
+    "\n"
+    "PART E - FAILURE MODE CATALOG:\n"
+    "  Aggregate all anticipated failure modes identified by sub-agents.\n"
+    "  Group by theme.\n"
+    "\n"
+    "PART F - SUB-QUESTION COVERAGE:\n"
+    "  For each sub-question from Step 5, summarize responses.\n"
+    "  Flag any with weak or no coverage.\n"
+    "\n"
+    "Preserve all disagreements exactly as found. Record positions without evaluation.\n"
+    "This step is purely organizational.\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "AGREEMENT MAP:\n"
+    "- [point]: supported by [sub-agents]\n"
+    "\n"
+    "DISAGREEMENT MAP:\n"
+    "- [contention]: [position A] vs [position B]\n"
+    "\n"
+    "UNIQUE CONTRIBUTIONS:\n"
+    "- [sub-agent]: [insight]\n"
+    "\n"
+    "INTERMEDIATE INSIGHTS:\n"
+    "- [insight from reasoning, not conclusion]\n"
+    "\n"
+    "FAILURE MODE CATALOG:\n"
+    "- [theme]: [modes]\n"
+    "\n"
+    "SUB-QUESTION COVERAGE:\n"
+    "- Q1: [coverage summary]\n"
+    "```"
+)
 
-    return base_actions
+# --- STEP 12: INITIAL_SYNTHESIS ---------------------------------------------
 
+SYNTHESIS_FULL_INSTRUCTIONS = (
+    "Integrate aggregated findings into a coherent response.\n"
+    "Hint: Prioritize aspects matching the EVALUATION CRITERIA from Step 3.\n"
+    "Work through thoroughly. Avoid shortcuts. Show reasoning step by step.\n"
+    "\n"
+    "SYNTHESIS GUIDELINES:\n"
+    "  1. Use evaluation criteria from Step 3 to guide integration\n"
+    "  2. Resolve disagreements using synthesis criteria from Step 5\n"
+    "  3. Draw on intermediate insights from Step 11, not just conclusions\n"
+    "  4. Acknowledge where genuine uncertainty remains\n"
+    "  5. Do not artificially harmonize positions that genuinely conflict\n"
+    "\n"
+    "PART A - CORE ANSWER:\n"
+    "  What is your integrated response to the original question?\n"
+    "  Structure appropriately for the question type from Step 3.\n"
+    "\n"
+    "PART B - KEY TRADE-OFFS:\n"
+    "  What trade-offs are inherent in this answer?\n"
+    "  What did you prioritize, and what did you deprioritize?\n"
+    "\n"
+    "PART C - DISSENTING VIEWS:\n"
+    "  Where did you override a sub-agent's position?\n"
+    "  Why not adopted, and what would change your mind?\n"
+    "\n"
+    "PART D - EVIDENCE GROUNDING:\n"
+    "  For each major claim, cite the evidence source:\n"
+    "  - From Step 2 (first principles)\n"
+    "  - From Step 4 (analogies)\n"
+    "  - From Step 11 (sub-agent findings or intermediate insights)\n"
+    "  Claims without grounding: flag as UNGROUNDED.\n"
+    "\n"
+    "PART E - ACKNOWLEDGED LIMITATIONS:\n"
+    "  What aspects does this synthesis NOT address well?\n"
+    "  What additional information would strengthen the analysis?\n"
+    "\n"
+    "PART F - CONFIDENCE MARKERS:\n"
+    "  Mark claims as:\n"
+    "  - HIGH: Strong agreement, multiple sources\n"
+    "  - MEDIUM: Reasonable but contested or single source\n"
+    "  - LOW: Speculative or limited evidence\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "CORE ANSWER:\n"
+    "[structured response]\n"
+    "\n"
+    "KEY TRADE-OFFS:\n"
+    "- Prioritized: [X] over [Y] because [reason]\n"
+    "\n"
+    "DISSENTING VIEWS:\n"
+    "- [sub-agent]: [position not adopted]: [why]\n"
+    "\n"
+    "EVIDENCE GROUNDING:\n"
+    "- [claim]: [source]\n"
+    "- UNGROUNDED: [list any ungrounded claims]\n"
+    "\n"
+    "LIMITATIONS:\n"
+    "- [limitation]\n"
+    "\n"
+    "CONFIDENCE: [overall assessment]\n"
+    "```\n"
+    "\n"
+    "This synthesis will be evaluated in Step 13. Expect to refine it."
+)
 
-# Workflow handlers
-def step_handler_simple(ctx: StepContext) -> tuple[Outcome, dict]:
-    """Generic handler for output-only steps."""
-    return Outcome.OK, {}
+SYNTHESIS_QUICK_INSTRUCTIONS = (
+    "Based on abstraction (Step 2) and analogies (Step 4), synthesize response.\n"
+    "Hint: Prioritize aspects matching the EVALUATION CRITERIA from Step 3.\n"
+    "Work through thoroughly. Avoid shortcuts. Show reasoning step by step.\n"
+    "\n"
+    "PART A - CORE ANSWER:\n"
+    "  What is your response to the original question?\n"
+    "  Ground in first principles from Step 2 and analogies from Step 4.\n"
+    "\n"
+    "PART B - EVIDENCE GROUNDING:\n"
+    "  For each major claim, cite source:\n"
+    "  - First principles (Step 2)\n"
+    "  - Analogical reasoning (Step 4)\n"
+    "  - Domain knowledge\n"
+    "  Claims without grounding: flag as UNGROUNDED.\n"
+    "\n"
+    "PART C - ACKNOWLEDGED LIMITATIONS:\n"
+    "  What aspects does this NOT address well?\n"
+    "  Where might alternative perspectives yield different conclusions?\n"
+    "\n"
+    "PART D - CONFIDENCE MARKERS:\n"
+    "  Mark claims as HIGH, MEDIUM, or LOW confidence with brief justification.\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "CORE ANSWER:\n"
+    "[structured response]\n"
+    "\n"
+    "EVIDENCE GROUNDING:\n"
+    "- [claim]: [source]\n"
+    "- UNGROUNDED: [list any]\n"
+    "\n"
+    "LIMITATIONS:\n"
+    "- [limitation]\n"
+    "\n"
+    "CONFIDENCE: [overall assessment]\n"
+    "```\n"
+    "\n"
+    "This synthesis will be evaluated in Step 13."
+)
 
+# --- STEP 13: ITERATIVE_REFINEMENT ------------------------------------------
 
-def step_planning(ctx: StepContext) -> tuple[Outcome, dict]:
-    """Handler for planning step that branches based on mode."""
-    mode = ctx.workflow_params.get("mode", "full")
-    if mode == "quick":
-        return Outcome.SKIP, {"mode": mode}
-    return Outcome.OK, {"mode": mode}
+REFINEMENT_INSTRUCTIONS = (
+    "ITERATION {iteration} OF {max_iter}\n"
+    "\n"
+    "RULE 0 (MANDATORY): Follow the invoke_after command. Do NOT skip\n"
+    "to step 14 unless confidence is CERTAIN or this is iteration 5.\n"
+    "\n"
+    "Critically evaluate the current synthesis.\n"
+    "Work through thoroughly -- avoid quick 'looks good' assessments.\n"
+    "\n"
+    "PART A - VERIFICATION QUESTION GENERATION:\n"
+    "  Generate 3-5 verification questions that would test correctness.\n"
+    "  Use OPEN questions ('What is X?', 'Where does Y occur?'), not yes/no.\n"
+    "  Yes/no questions bias toward agreement regardless of correctness.\n"
+    "  Focus on:\n"
+    "  - Claims marked LOW or MEDIUM confidence\n"
+    "  - Any UNGROUNDED claims from Step 12\n"
+    "  - Potential blind spots\n"
+    "  - Failure modes that could invalidate key proposals\n"
+    "  - Edge cases the synthesis might not handle\n"
+    "\n"
+    "PART B - INDEPENDENT VERIFICATION:\n"
+    "  For each verification question, answer based ONLY on:\n"
+    "  - First principles from Step 2\n"
+    "  - Analogies from Step 4\n"
+    "  - Aggregated evidence from Step 11 (if Full mode)\n"
+    "\n"
+    "  CRITICAL: Do NOT look at the synthesis while answering.\n"
+    "  Answer based on evidence, not what the synthesis claims.\n"
+    "\n"
+    "  EXPLORATION OPTION:\n"
+    "  If a verification question cannot be answered with existing evidence:\n"
+    "  - Use Read/Glob/Grep to find concrete evidence in the codebase\n"
+    "  - This is especially valuable for UNGROUNDED claims from Step 12\n"
+    "  - Keep exploration bounded -- answer the specific question, then stop\n"
+    "  - Update answer with exploration findings and cite sources\n"
+    "\n"
+    "PART C - DISCREPANCY IDENTIFICATION:\n"
+    "  Compare verification answers against current synthesis.\n"
+    "  Where do they differ?\n"
+    "  List each discrepancy.\n"
+    "\n"
+    "PART D - ACTIONABLE FEEDBACK:\n"
+    "  For each discrepancy or issue, provide feedback.\n"
+    "\n"
+    "  Each piece of feedback MUST include all three elements:\n"
+    "    1. ELEMENT: Name the specific claim, section, or aspect\n"
+    "    2. PROBLEM: State precisely what is wrong or unsupported\n"
+    "    3. ACTION: Propose a concrete fix or revision\n"
+    "\n"
+    "  Feedback missing any element should be discarded as too vague.\n"
+    "\n"
+    "  GOOD: 'ELEMENT: claim X. PROBLEM: contradicts evidence Y. ACTION: qualify with Z.'\n"
+    "  BAD: 'The analysis could be stronger.' (no specific element/problem/action)\n"
+    "\n"
+    "PART E - SYNTHESIS UPDATE:\n"
+    "  Review feedback from ALL previous iterations (if any).\n"
+    "  Based on actionable feedback, revise the synthesis.\n"
+    "  Avoid repeating mistakes identified in prior iterations.\n"
+    "  For each revision, note which feedback item it addresses.\n"
+    "\n"
+    "PART F - CONFIDENCE ASSESSMENT:\n"
+    "  After revisions, assess confidence:\n"
+    "  - EXPLORING: Still developing understanding\n"
+    "  - LOW: Significant gaps or unresolved issues\n"
+    "  - MEDIUM: Reasonable answer but some uncertainty\n"
+    "  - HIGH: Strong answer, minor refinements possible\n"
+    "  - CERTAIN: As good as it can get with available information\n"
+    "\n"
+    "  Provide specific justification for confidence level.\n"
+    "\n"
+    "<iteration_gate>\n"
+    "CRITICAL: You MUST follow the invoke_after command exactly.\n"
+    "\n"
+    "EXIT CONDITIONS (both required to proceed to step 14):\n"
+    "  1. Confidence = CERTAIN, OR\n"
+    "  2. This is iteration 5 (final iteration)\n"
+    "\n"
+    "If NEITHER condition is met, STOP.\n"
+    "Do NOT proceed to step 14. Continue to the next iteration.\n"
+    "</iteration_gate>\n"
+    "\n"
+    "OUTPUT FORMAT:\n"
+    "```\n"
+    "VERIFICATION QUESTIONS:\n"
+    "1. [question]\n"
+    "\n"
+    "INDEPENDENT ANSWERS:\n"
+    "1. [answer without looking at synthesis]\n"
+    "\n"
+    "DISCREPANCIES:\n"
+    "- [where synthesis differs from verification]\n"
+    "\n"
+    "ACTIONABLE FEEDBACK:\n"
+    "- ELEMENT: [what]. PROBLEM: [why wrong]. ACTION: [fix]\n"
+    "\n"
+    "REVISED SYNTHESIS:\n"
+    "[updated synthesis]\n"
+    "\n"
+    "CONFIDENCE: [level]\n"
+    "JUSTIFICATION: [why this level]\n"
+    "```"
+)
 
+# --- STEP 14: FORMATTING_OUTPUT ---------------------------------------------
 
-def step_full_only(ctx: StepContext) -> tuple[Outcome, dict]:
-    """Handler for steps that should be skipped in quick mode."""
-    mode = ctx.workflow_params.get("mode", "full")
-    if mode == "quick":
-        return Outcome.SKIP, {}
-    return Outcome.OK, {}
-
-
-def step_initial_synthesis(ctx: StepContext) -> tuple[Outcome, dict]:
-    """Handler for initial synthesis step."""
-    return Outcome.OK, {}
-
-
-def step_iterative_refinement(ctx: StepContext) -> tuple[Outcome, dict]:
-    """Handler for iterative refinement step with confidence loop."""
-    iteration = ctx.step_state.get("iteration", 1)
-    confidence = ctx.workflow_params.get("confidence", "exploring")
-
-    if confidence == "certain" or iteration >= MAX_ITERATIONS:
-        return Outcome.OK, {"iteration": iteration, "confidence": confidence}
-    else:
-        return Outcome.ITERATE, {"iteration": iteration + 1, "confidence": confidence}
-
-
-def step_formatting_output(ctx: StepContext) -> tuple[Outcome, dict]:
-    """Handler for final formatting step."""
-    return Outcome.OK, {}
-
-
-# Workflow definition
-WORKFLOW = Workflow(
-    "deepthink",
-    StepDef(
-        id="context_clarification",
-        title="Context Clarification",
-        actions=STEPS[1]["actions"],
-        handler=step_handler_simple,
-        next={Outcome.OK: "abstraction"},
-    ),
-    StepDef(
-        id="abstraction",
-        title="Abstraction",
-        actions=STEPS[2]["actions"],
-        handler=step_handler_simple,
-        next={Outcome.OK: "characterization"},
-    ),
-    StepDef(
-        id="characterization",
-        title="Characterization",
-        actions=STEPS[3]["actions"],
-        handler=step_handler_simple,
-        next={Outcome.OK: "analogical_recall"},
-    ),
-    StepDef(
-        id="analogical_recall",
-        title="Analogical Recall",
-        actions=STEPS[4]["actions"],
-        handler=step_handler_simple,
-        next={Outcome.OK: "planning"},
-    ),
-    StepDef(
-        id="planning",
-        title="Planning",
-        actions=STEPS[5]["actions"],
-        handler=step_planning,
-        next={
-            Outcome.OK: "subagent_design",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="subagent_design",
-        title="Sub-Agent Design",
-        actions=STEPS[6]["actions"],
-        handler=step_full_only,
-        next={
-            Outcome.OK: "design_critique",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="design_critique",
-        title="Design Critique",
-        actions=STEPS[7]["actions"],
-        handler=step_full_only,
-        next={
-            Outcome.OK: "design_revision",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="design_revision",
-        title="Design Revision",
-        actions=STEPS[8]["actions"],
-        handler=step_full_only,
-        next={
-            Outcome.OK: "dispatch",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="dispatch",
-        title="Dispatch",
-        actions=[],
-        handler=step_full_only,
-        next={
-            Outcome.OK: "quality_gate",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="quality_gate",
-        title="Quality Gate",
-        actions=STEPS[10]["actions"],
-        handler=step_full_only,
-        next={
-            Outcome.OK: "aggregation",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="aggregation",
-        title="Aggregation",
-        actions=STEPS[11]["actions"],
-        handler=step_full_only,
-        next={
-            Outcome.OK: "initial_synthesis",
-            Outcome.SKIP: "initial_synthesis",
-        },
-    ),
-    StepDef(
-        id="initial_synthesis",
-        title="Initial Synthesis",
-        actions=[],
-        handler=step_initial_synthesis,
-        next={Outcome.OK: "iterative_refinement"},
-    ),
-    StepDef(
-        id="iterative_refinement",
-        title="Iterative Refinement",
-        actions=[],
-        handler=step_iterative_refinement,
-        next={
-            Outcome.OK: "formatting_output",
-            Outcome.ITERATE: "iterative_refinement",
-        },
-    ),
-    StepDef(
-        id="formatting_output",
-        title="Formatting & Output",
-        actions=[],
-        handler=step_formatting_output,
-        next={Outcome.OK: None},
-    ),
-    description="Structured reasoning for open-ended analytical questions",
+FORMATTING_INSTRUCTIONS = (
+    "Refinement complete. Confidence: {confidence}.\n"
+    "\n"
+    "Present the final answer to the user.\n"
+    "\n"
+    "FORMATTING REQUIREMENTS:\n"
+    "  - Lead with the direct answer to the original question\n"
+    "  - Use the answer structure determined in Step 3\n"
+    "  - Integrate key trade-offs naturally into the explanation\n"
+    "  - Note limitations only where they materially affect the answer\n"
+    "  - Omit workflow artifacts (step references, sub-agent names, etc.)\n"
+    "\n"
+    "CONFIDENCE: {confidence_guidance}\n"
+    "\n"
+    "OUTPUT: Clean prose response directly addressing the user's question.\n"
+    "        No meta-commentary about the analysis process."
 )
 
 
-def get_step_1_output(args, step_info):
-    """Handle Step 1: Context Clarification."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 2 --total-steps {args.total_steps}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-        is_step_zero=True,
+# ============================================================================
+# MESSAGE BUILDERS
+# ============================================================================
+
+
+def build_dispatch_body() -> str:
+    """Build DISPATCH instructions with roster_dispatch()."""
+    invoke_cmd = f'python3 -m {SUBAGENT_MODULE_PATH} --step 1'
+
+    dispatch_text = roster_dispatch(
+        agent_type="general-purpose",
+        agents=DISPATCH_AGENTS,
+        command=invoke_cmd,
+        shared_context=DISPATCH_CONTEXT,
+        model="sonnet",
+        instruction="Launch ALL sub-agents from FINAL SUB-AGENT DEFINITIONS (Step 8). Use a SINGLE message with multiple Task tool calls.",
     )
 
-
-def get_step_2_output(args, step_info):
-    """Handle Step 2: Abstraction."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 3 --total-steps {args.total_steps}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
+    return dispatch_text
 
 
-def get_step_3_output(args, step_info):
-    """Handle Step 3: Characterization."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 4 --total-steps {args.total_steps}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
+def build_next_command(step: int, mode: str, confidence: str, iteration: int) -> str | None:
+    """Build invoke command for next step."""
+    base = f'python3 -m {MODULE_PATH}'
+
+    if step == 1:
+        return f'{base} --step 2'
+    elif step == 2:
+        return f'{base} --step 3'
+    elif step == 3:
+        return f'{base} --step 4'
+    elif step == 4:
+        return f'{base} --step 5'
+    elif step == 5:
+        return f'If FULL: {base} --step 6 --mode full\nIf QUICK: {base} --step 12 --mode quick'
+    elif step == 6:
+        return f'{base} --step 7 --mode {mode}'
+    elif step == 7:
+        return f'{base} --step 8 --mode {mode}'
+    elif step == 8:
+        return f'{base} --step 9 --mode {mode}'
+    elif step == 9:
+        return f'{base} --step 10 --mode {mode}'
+    elif step == 10:
+        return f'{base} --step 11 --mode {mode}'
+    elif step == 11:
+        return f'{base} --step 12 --mode {mode}'
+    elif step == 12:
+        return f'{base} --step 13 --confidence <your_confidence> --iteration 1 --mode {mode}'
+    elif step == 13:
+        if confidence == "certain" or iteration >= MAX_ITERATIONS:
+            return f'{base} --step 14 --confidence {confidence} --mode {mode}'
+        else:
+            return f'{base} --step 13 --confidence <your_confidence> --iteration {iteration + 1} --mode {mode}'
+    elif step == 14:
+        return None
+
+    return None
 
 
-def get_step_4_output(args, step_info):
-    """Handle Step 4: Analogical Recall."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 5 --total-steps {args.total_steps}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
+# ============================================================================
+# STEP DEFINITIONS
+# ============================================================================
 
-
-def get_step_5_output(args, step_info):
-    """Handle Step 5: Planning (branches based on mode)."""
-    actions = list(step_info["actions"]) + [
-        "",
-        "<mode_branch>",
-        "  <if_full>Proceed to Step 6 (Sub-Agent Design)</if_full>",
-        "  <if_quick>Skip to Step 12 (Initial Synthesis)</if_quick>",
-        "</mode_branch>",
-    ]
-
-    next_cmd_full = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 6 --total-steps {args.total_steps} --mode full" />'
-    next_cmd_quick = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 12 --total-steps {args.total_steps} --mode quick" />'
-
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=f"If FULL: {next_cmd_full}\nIf QUICK: {next_cmd_quick}",
-    )
-
-
-def get_step_6_output(args, step_info):
-    """Handle Step 6: Sub-Agent Design."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 7 --total-steps {args.total_steps} --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_7_output(args, step_info):
-    """Handle Step 7: Design Critique."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 8 --total-steps {args.total_steps} --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_8_output(args, step_info):
-    """Handle Step 8: Design Revision."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 9 --total-steps {args.total_steps} --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_9_output(args, step_info):
-    """Handle Step 9: Dispatch."""
-    actions = get_dispatch_actions()
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 10 --total-steps {args.total_steps} --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_10_output(args, step_info):
-    """Handle Step 10: Quality Gate."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 11 --total-steps {args.total_steps} --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_11_output(args, step_info):
-    """Handle Step 11: Aggregation."""
-    actions = list(step_info.get("actions", []))
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 12 --total-steps {args.total_steps} --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_12_output(args, step_info):
-    """Handle Step 12: Initial Synthesis (mode-dependent)."""
-    if args.mode == "quick":
-        actions = get_synthesis_actions_quick()
-    else:
-        actions = get_synthesis_actions_full()
-
-    next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 13 --total-steps {args.total_steps} --confidence <your_confidence> --iteration 1 --mode {args.mode}" />'
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_13_output(args, step_info):
-    """Handle Step 13: Iterative Refinement with loop logic."""
-    actions = get_refinement_actions(args.iteration)
-
-    if args.confidence == "certain" or args.iteration >= MAX_ITERATIONS:
-        next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 14 --total-steps {args.total_steps} --confidence {args.confidence} --mode {args.mode}" />'
-        title = f"DEEPTHINK - {step_info['title']} (Iteration {args.iteration}) -> Complete"
-    else:
-        next_cmd = f'<invoke working-dir=".claude/skills/scripts" cmd="python3 -m {MODULE_PATH} --step 13 --total-steps {args.total_steps} --confidence <your_confidence> --iteration {args.iteration + 1} --mode {args.mode}" />'
-        title = f"DEEPTHINK - {step_info['title']} (Iteration {args.iteration})"
-
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=title,
-        actions=actions,
-        next_command=next_cmd,
-    )
-
-
-def get_step_14_output(args, step_info):
-    """Handle Step 14: Formatting & Output (terminal step)."""
-    actions = get_completion_message(args.confidence)
-    return format_step_output(
-        step=args.step,
-        total=args.total_steps,
-        title=f"DEEPTHINK - {step_info['title']}",
-        actions=actions,
-        next_command=None,
-    )
-
-
-STEP_HANDLERS = {
-    1: get_step_1_output,
-    2: get_step_2_output,
-    3: get_step_3_output,
-    4: get_step_4_output,
-    5: get_step_5_output,
-    6: get_step_6_output,
-    7: get_step_7_output,
-    8: get_step_8_output,
-    9: get_step_9_output,
-    10: get_step_10_output,
-    11: get_step_11_output,
-    12: get_step_12_output,
-    13: get_step_13_output,
-    14: get_step_14_output,
+# Static steps: (title, instructions) tuples for steps with constant content
+STATIC_STEPS = {
+    1: ("Context Clarification", CONTEXT_CLARIFICATION_INSTRUCTIONS),
+    2: ("Abstraction", ABSTRACTION_INSTRUCTIONS),
+    3: ("Characterization", CHARACTERIZATION_INSTRUCTIONS),
+    4: ("Analogical Recall", ANALOGICAL_RECALL_INSTRUCTIONS),
+    5: ("Planning", PLANNING_INSTRUCTIONS),
+    6: ("Sub-Agent Design", SUBAGENT_DESIGN_INSTRUCTIONS),
+    7: ("Design Critique", DESIGN_CRITIQUE_INSTRUCTIONS),
+    8: ("Design Revision", DESIGN_REVISION_INSTRUCTIONS),
+    10: ("Quality Gate", QUALITY_GATE_INSTRUCTIONS),
+    11: ("Aggregation", AGGREGATION_INSTRUCTIONS),
 }
 
 
-def main(
-    step: int = None,
-    total_steps: int = None,
-    confidence: str | None = None,
-    iteration: int | None = None,
-    mode: str | None = None,
-):
-    """Entry point with parameter annotations for testing framework.
+def _format_step_9(mode: str, confidence: str, iteration: int) -> tuple[str, str]:
+    """Step 9: Dispatch - builds dispatch body via roster_dispatch()."""
+    return ("Dispatch", build_dispatch_body())
 
-    Note: Parameters have defaults because actual values come from argparse.
-    The annotations are metadata for the testing framework.
+
+def _format_step_12(mode: str, confidence: str, iteration: int) -> tuple[str, str]:
+    """Step 12: Initial Synthesis - selects instructions based on mode."""
+    body = SYNTHESIS_FULL_INSTRUCTIONS if mode == "full" else SYNTHESIS_QUICK_INSTRUCTIONS
+    return ("Initial Synthesis", body)
+
+
+def _format_step_13(mode: str, confidence: str, iteration: int) -> tuple[str, str]:
+    """Step 13: Iterative Refinement - parameterized title and body."""
+    suffix = " -> Complete" if confidence == "certain" or iteration >= MAX_ITERATIONS else ""
+    title = f"Iterative Refinement (Iteration {iteration}){suffix}"
+    body = REFINEMENT_INSTRUCTIONS.format(iteration=iteration, max_iter=MAX_ITERATIONS)
+    return (title, body)
+
+
+def _format_step_14(mode: str, confidence: str, iteration: int) -> tuple[str, str]:
+    """Step 14: Formatting & Output - parameterized with confidence guidance."""
+    confidence_upper = confidence.upper()
+    if confidence == "certain":
+        guidance = "HIGH\n  Present with authority. Hedging language unnecessary."
+    else:
+        guidance = f"{confidence_upper}\n  Flag specific claims with lower confidence.\n  Indicate what additional information would strengthen the analysis."
+    body = FORMATTING_INSTRUCTIONS.format(confidence=confidence_upper, confidence_guidance=guidance)
+    return ("Formatting & Output", body)
+
+
+# Dynamic steps: functions that compute (title, instructions) based on parameters
+# Functions must be defined BEFORE this dictionary (book pattern)
+DYNAMIC_STEPS = {
+    9: _format_step_9,
+    12: _format_step_12,
+    13: _format_step_13,
+    14: _format_step_14,
+}
+
+
+# ============================================================================
+# OUTPUT FORMATTING
+# ============================================================================
+
+
+def format_output(step: int, mode: str, confidence: str, iteration: int) -> str:
+    """Format output for the given step.
+
+    Uses callable dispatch: static steps lookup (title, instructions) from
+    STATIC_STEPS dict; dynamic steps call formatter functions from DYNAMIC_STEPS.
     """
+    if step in STATIC_STEPS:
+        title, instructions = STATIC_STEPS[step]
+    elif step in DYNAMIC_STEPS:
+        formatter = DYNAMIC_STEPS[step]
+        title, instructions = formatter(mode, confidence, iteration)
+    else:
+        return f"ERROR: Invalid step {step}"
+
+    next_cmd = build_next_command(step, mode, confidence, iteration)
+    return format_step(instructions, next_cmd or "", title=f"DEEPTHINK - {title}")
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+
+def main():
+    """Entry point for deepthink workflow."""
     parser = argparse.ArgumentParser(
         description="DeepThink - Structured reasoning for open-ended analytical questions",
         epilog="Steps: 1-14 (Full mode) or 1-5,12-14 (Quick mode)",
     )
     parser.add_argument("--step", type=int, required=True)
-    parser.add_argument("--total-steps", type=int, required=True)
     parser.add_argument(
         "--confidence",
         type=str,
@@ -1350,23 +1047,10 @@ def main(
     )
     args = parser.parse_args()
 
-    if args.step < 1:
-        sys.exit("ERROR: --step must be >= 1")
-    if args.total_steps != 14:
-        sys.exit("ERROR: --total-steps must be 14 (steps 1-14)")
-    if args.step > 14:
-        sys.exit("ERROR: --step cannot exceed 14")
+    if args.step < 1 or args.step > 14:
+        sys.exit("ERROR: --step must be 1-14")
 
-    step_info = STEPS.get(args.step)
-    if not step_info:
-        sys.exit(f"ERROR: Invalid step {args.step}")
-
-    handler = STEP_HANDLERS.get(args.step)
-    if not handler:
-        sys.exit(f"ERROR: No handler for step {args.step}")
-
-    output = handler(args, step_info)
-    print(output)
+    print(format_output(args.step, args.mode, args.confidence, args.iteration))
 
 
 if __name__ == "__main__":

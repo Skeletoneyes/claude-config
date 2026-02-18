@@ -21,12 +21,11 @@ SKILL_MODULES = [
     "skills.decision_critic.decision_critic",
     "skills.leon_writing_style.writing_style",
     "skills.problem_analysis.analyze",
-    "skills.codebase_analysis.analyze_workflow",
+    "skills.codebase_analysis.analyze",
     "skills.deepthink.think",
     "skills.incoherence.incoherence",
     "skills.refactor.refactor",
-    "skills.planner.planner",
-    "skills.solution_design.design",
+    "skills.planner.orchestrator.planner",
     "skills.prompt_engineer.optimize",
 ]
 
@@ -54,7 +53,7 @@ def run_skill_invocation(workflow, inputs: dict[str, Any]) -> tuple[bool, str]:
         (True, stdout) on success
         (False, error_message) on failure
     """
-    # Build command: python -m module --step N --total-steps T ...
+    # Build command: python -m module --step N ...
     module_path = workflow._module_path or f"skills.{workflow.name}.{workflow.name}"
     cmd = [sys.executable, "-m", module_path]
     for k, v in inputs.items():

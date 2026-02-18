@@ -194,7 +194,6 @@ StepDef(
     handler=Dispatch(
         agent=AgentRole.QUALITY_REVIEWER,
         script="skills.planner.qr.plan_completeness",
-        total_steps=1,
     ),
     next={Outcome.OK: "implementation", Outcome.FAIL: "revise_plan"}
 )
@@ -240,7 +239,6 @@ WORKFLOW = Workflow(
     StepDef(
         id="extract_structure",
         title="Extract Structure",
-        phase="DECOMPOSITION",
         actions=[...],
         handler=step_handler,
         next={Outcome.OK: "classify_verifiability"},
@@ -248,7 +246,6 @@ WORKFLOW = Workflow(
     StepDef(
         id="classify_verifiability",
         title="Classify Verifiability",
-        phase="DECOMPOSITION",
         actions=[...],
         handler=step_handler,
         next={Outcome.OK: "generate_questions"},
@@ -360,13 +357,159 @@ StepDef(
     handler=Dispatch(
         agent=AgentRole.QUALITY_REVIEWER,
         script="skills.planner.qr.plan_completeness",
-        total_steps=1,
     ),
     next={
         Outcome.OK: "implementation",   # QRStatus.PASS -> Outcome.OK
         Outcome.FAIL: "revise_plan",    # QRStatus.FAIL -> Outcome.FAIL
     },
 )
+```
+
+### Pattern 5: Hybrid Static/Dynamic Steps (deepthink)
+
+Workflows with mostly static steps and few parameterized steps benefit from a hybrid approach:
+
+```python
+# ============================================================================
+# MESSAGE BUILDERS
+# ============================================================================
+
+def build_dispatch_body() -> str:
+    """Builder functions that dynamic formatters may call."""
+    # ... implementation
+    return dispatch_text
+
+
+# ============================================================================
+# STEP DEFINITIONS
+# ============================================================================
+
+# Static steps: (title, instructions) tuples
+STATIC_STEPS = {
+    1: ("Context Clarification", CONTEXT_CLARIFICATION_INSTRUCTIONS),
+    2: ("Abstraction", ABSTRACTION_INSTRUCTIONS),
+    # ... more static steps
+}
+
+
+# Dynamic formatter functions - defined BEFORE DYNAMIC_STEPS dict
+def _format_step_9(mode: str, confidence: str, iteration: int) -> tuple[str, str]:
+    """Dynamic step that calls a builder function."""
+    return ("Dispatch", build_dispatch_body())
+
+
+def _format_step_13(mode: str, confidence: str, iteration: int) -> tuple[str, str]:
+    """Dynamic step with parameterized title and body."""
+    suffix = " -> Complete" if confidence == "certain" else ""
+    title = f"Iterative Refinement (Iteration {iteration}){suffix}"
+    body = INSTRUCTIONS.format(iteration=iteration, max_iter=MAX_ITERATIONS)
+    return (title, body)
+
+
+# Dynamic steps dict - references functions defined above
+DYNAMIC_STEPS = {
+    9: _format_step_9,
+    13: _format_step_13,
+}
+
+
+# ============================================================================
+# OUTPUT FORMATTING
+# ============================================================================
+
+def format_output(step: int, mode: str, confidence: str, iteration: int) -> str:
+    """Callable dispatch: static lookup or dynamic function call."""
+    if step in STATIC_STEPS:
+        title, instructions = STATIC_STEPS[step]
+    elif step in DYNAMIC_STEPS:
+        title, instructions = DYNAMIC_STEPS[step](mode, confidence, iteration)
+    else:
+        return f"ERROR: Invalid step {step}"
+
+    next_cmd = build_next_command(step, mode, confidence, iteration)
+    return format_step(instructions, next_cmd or "", title=f"WORKFLOW - {title}")
+```
+
+**Ordering constraint (book pattern)**: Dynamic formatter functions that call MESSAGE BUILDERS must appear AFTER MESSAGE BUILDERS. The DYNAMIC_STEPS dictionary must appear AFTER all `_format_step_*` functions it references.
+
+Use this pattern when:
+
+- Many steps share the same structure (title + constant body)
+- Few steps need parameters for title or body construction
+- Parameters are uniform across all dynamic steps
+
+Benefits:
+
+- Compact representation for static steps (one line per step)
+- Clear, readable functions for dynamic steps
+- Single dispatch point in `format_output()`
+- Follows "book pattern" (all references resolve to definitions above)
+
+## Question Relay Protocol
+
+Sub-agents can request user clarification via the main agent. The protocol is
+pure prompt coordination -- no Python interception.
+
+### Design Decisions
+
+**Task Reinvocation (not Resume)**: When a sub-agent yields with questions,
+the orchestrator REINVOKES it fresh (new Task, no resume parameter) after
+getting user answers. The sub-agent saves state to plan.json before yielding,
+then reads it back after reinvocation. This was chosen over resume because:
+
+- Resume semantics are unreliable (0 tokens, 0 tool uses failures)
+- State file reading is explicit and auditable
+- Clean slate avoids stale context issues
+- Sub-agent scripts can detect continuation (plan.json exists)
+
+**Questions-only output**: When a sub-agent needs clarification, it emits ONLY
+the `<needs_user_input>` XML block. Nothing else. This makes detection
+unambiguous -- no heuristic parsing of natural language.
+
+**Explicit XML markers**: We use structured XML tags rather than detecting
+question marks in prose. This prevents false positives from rhetorical questions
+in analysis output.
+
+**Max 3 questions, 2-3 options**: Constraints match AskUserQuestion tool schema.
+Batching reduces round-trips. Options should be distinct and actionable.
+
+**State saving before yield**: Sub-agents MUST save all progress to plan.json
+before emitting `<needs_user_input>`. The reinvoked instance reads this state.
+
+### Flow
+
+1. Sub-agent saves current state to plan.json
+2. Sub-agent emits `<needs_user_input>` XML as entire response
+3. Main agent extracts questions, calls AskUserQuestion
+4. Main agent REINVOKES sub-agent fresh with answers and STATE_DIR
+5. New sub-agent instance reads plan.json, continues from saved state
+
+### Constants
+
+| Constant                    | Purpose                                  |
+| --------------------------- | ---------------------------------------- |
+| `SUB_AGENT_QUESTION_FORMAT` | Tells sub-agent how to emit questions    |
+| `QUESTION_RELAY_HANDLER`    | Tells main agent how to detect and relay |
+
+### Integration
+
+For dispatch steps that support question relay:
+
+```python
+from skills.lib.workflow.constants import QUESTION_RELAY_HANDLER
+
+# In format_output or step handler for dispatch steps:
+if step_info.get("supports_questions"):
+    actions.append(QUESTION_RELAY_HANDLER)
+```
+
+For sub-agent scripts that may ask questions:
+
+```python
+from skills.lib.workflow.constants import SUB_AGENT_QUESTION_FORMAT
+
+# In step 1 guidance:
+actions.append(SUB_AGENT_QUESTION_FORMAT)
 ```
 
 ## Invariants
