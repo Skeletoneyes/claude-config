@@ -141,6 +141,35 @@ git fetch workflow
 git merge workflow/main --allow-unrelated-histories
 ```
 
+### Symlink Install (existing ~/.claude, no merge)
+
+If you already have a `~/.claude/` directory with credentials, history, and
+settings and prefer not to merge, you can clone the repo as a subdirectory and
+symlink the skill/config directories:
+
+```bash
+# Clone the repo inside your existing config directory
+git clone https://github.com/Skeletoneyes/claude-config ~/.claude/claude-config
+
+# Symlink the directories Claude Code looks for
+# Linux / macOS
+ln -s ~/.claude/claude-config/skills ~/.claude/skills
+ln -s ~/.claude/claude-config/agents ~/.claude/agents
+ln -s ~/.claude/claude-config/conventions ~/.claude/conventions
+ln -s ~/.claude/claude-config/output-styles ~/.claude/output-styles
+
+# Windows (run from an elevated prompt or with Developer Mode enabled)
+mklink /D "%USERPROFILE%\.claude\skills" "%USERPROFILE%\.claude\claude-config\skills"
+mklink /D "%USERPROFILE%\.claude\agents" "%USERPROFILE%\.claude\claude-config\agents"
+mklink /D "%USERPROFILE%\.claude\conventions" "%USERPROFILE%\.claude\claude-config\conventions"
+mklink /D "%USERPROFILE%\.claude\output-styles" "%USERPROFILE%\.claude\claude-config\output-styles"
+```
+
+This keeps the repo self-contained. To update, just `git pull` inside
+`~/.claude/claude-config/` and the symlinks pick up changes automatically.
+Your existing `~/.claude/` files (credentials, history, settings) remain
+untouched.
+
 ## Usage
 
 The workflow for non-trivial changes: explore -> plan -> execute.
