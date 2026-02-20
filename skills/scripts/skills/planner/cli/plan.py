@@ -204,7 +204,7 @@ def save_plan(state_dir: Path, plan: "Plan"):
     path = get_plan_path(state_dir)
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(plan.model_dump_json(indent=2))
-    tmp_path.rename(path)
+    os.replace(str(tmp_path), str(path))
     # Catch schema violations immediately after mutation
     from ..shared.schema import validate_state
     validate_state(str(state_dir))

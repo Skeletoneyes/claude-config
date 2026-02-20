@@ -17,7 +17,8 @@ from string import Template
 # ============================================================================
 
 # subagent.py -> prompts -> workflow -> lib -> skills -> scripts
-SKILLS_DIR = Path(__file__).resolve().parent.parent.parent.parent.parent
+# .as_posix() prevents Bash escape-sequence mangling on Windows
+SKILLS_DIR = Path(__file__).resolve().parent.parent.parent.parent.parent.as_posix()
 
 
 # ============================================================================
@@ -155,6 +156,10 @@ def task_tool_instruction(agent_type: str, model: str | None) -> str:
 
 def sub_agent_invoke(cmd: str) -> str:
     """Tell sub-agent what command to run after spawning."""
+    # Normalize Windows backslashes to forward slashes to prevent Bash
+    # escape-sequence mangling (\U, \j, \A etc. in temp paths).
+    # Python on Windows handles forward slashes correctly.
+    cmd = cmd.replace('\\', '/')
     return SUB_AGENT_INVOKE.format(working_dir=SKILLS_DIR, cmd=cmd)
 
 

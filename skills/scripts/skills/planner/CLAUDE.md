@@ -24,6 +24,7 @@ Planning and execution workflows with QR gates, TW passes, and Dev execution. St
 
 | Directory           | What                                   | When to read                               |
 | ------------------- | -------------------------------------- | ------------------------------------------ |
+| `devrunner/`        | Artifact-based test verification (brief authoring, analysis, iteration constants) | DevRunner workflow, trust boundary, de-escalation |
 | `orchestrator/`     | Main workflows (planner, executor)     | Creating/executing plans                   |
 | `architect/`        | Plan design sub-agent                  | Understanding planning workflow            |
 | `developer/`        | Code filling and implementation        | Dev execution, diff creation               |

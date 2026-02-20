@@ -335,7 +335,7 @@ def increment_qr_iteration(state_dir: str, phase: str) -> int | None:
     try:
         with os.fdopen(fd, 'w') as tmp:
             json.dump(qr_state, tmp, indent=2)
-        os.rename(tmp_path, str(path))
+        os.replace(tmp_path, str(path))
     except Exception:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)

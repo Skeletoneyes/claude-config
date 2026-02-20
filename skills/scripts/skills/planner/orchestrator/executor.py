@@ -33,6 +33,11 @@ from skills.planner.shared.constraints import (
     ORCHESTRATOR_CONSTRAINT,
     format_state_banner,
 )
+from skills.planner.devrunner.constants import (
+    DEVRUNNER_ITERATION_LIMIT,
+    DEVRUNNER_ITERATION_DEFAULT,
+    get_devrunner_blocking_severities,
+)
 
 
 # Module path for -m invocation
@@ -254,75 +259,180 @@ def format_gate(step: int, gate: GateConfig, qr: QRState, total_steps: int) -> s
     return format_step(body, next_cmd, title=f"{gate.qr_name} Gate")
 
 
+def _build_step_3_retry_actions(qr: QRState) -> list:
+    """Build action lines for step 3 fix mode (Code QR found issues)."""
+    mode_script = get_mode_script_path("dev/fix-code.py")
+    invoke_cmd = f"python3 -m {mode_script} --step 1 --qr-fail --qr-iteration {qr.iteration}"
+    actions = [
+        format_state_banner("IMPLEMENTATION FIX", qr.iteration, "fix"),
+        "",
+        "FIX MODE: Code QR found issues.",
+        "",
+        ORCHESTRATOR_CONSTRAINT,
+        "",
+        subagent_dispatch(agent_type="developer", command=invoke_cmd),
+        "",
+        "Developer reads QR report and fixes issues in <milestone> blocks.",
+        "After developer completes, re-run Code QR for fresh verification.",
+    ]
+    return actions
+
+
+def _build_step_3_devrunner_brief_actions() -> list:
+    """Build action lines for DevRunner step 4a: brief authoring."""
+    brief_author_script = get_mode_script_path("devrunner/brief_author.py")
+    return [
+        "  4a. BRIEF AUTHORING (for milestones with devrunner-verified flag):",
+        "     Run ONCE per milestone (first wave iteration only, or if manifest",
+        "     structure changed since last brief authoring).",
+        "     Skip if test_output/brief.json already exists and manifest has not changed.",
+        "",
+        "     ERROR HANDLING: If brief authoring fails (crash, timeout, malformed output),",
+        "     log the error and skip DevRunner analysis (step 4b) for this iteration.",
+        "     The wave continues without blocking. Retry brief authoring next iteration.",
+        "",
+        subagent_dispatch(
+            agent_type="quality-reviewer",
+            command=(
+                f"python3 -m {brief_author_script} --step 1 --plan-file $PLAN_FILE"
+                " --milestone [MILESTONE] --manifest-path test_output/manifest.json"
+                " --output-path test_output/brief.json"
+            ),
+            prompt=(
+                "Author brief.json claims for DevRunner analysis. "
+                "Read plan acceptance criteria and manifest.json to produce brief.json "
+                "with severity-tagged claims. "
+                "PLAN_FILE=$PLAN_FILE MILESTONE=[MILESTONE] "
+                "MANIFEST_PATH=test_output/manifest.json OUTPUT_PATH=test_output/brief.json"
+            ),
+        ),
+    ]
+
+
+def _build_devrunner_iter_table() -> str:
+    """Build the iteration-to-blocking-severities table string."""
+    lines = []
+    for i in range(1, DEVRUNNER_ITERATION_LIMIT + 1):
+        sev = get_devrunner_blocking_severities(i)
+        sev_str = ",".join(s for s in ["MUST", "SHOULD", "COULD"] if s in sev)
+        lines.append(f"     iter {i}: --blocking-severities {sev_str}")
+    return "\n".join(lines)
+
+
+def _build_analysis_dispatch(analysis_script: str, tier: str, agent: str) -> str:
+    """Build a single-tier analysis subagent_dispatch string."""
+    return subagent_dispatch(
+        agent_type=agent,
+        command=f"python3 -m {analysis_script} --step 1 --analysis-tier {tier} --blocking-severities [BLOCKING_SEVERITIES]",
+        prompt=(
+            f"Analyze DevRunner test artifacts ({tier} tier). "
+            "BRIEF_PATH=test_output/brief.json MANIFEST_PATH=test_output/manifest.json "
+            f"ANALYSIS_TIER={tier} "
+            "Substitute [BLOCKING_SEVERITIES] with the comma-separated severity set for "
+            "the current devrunner_iteration (see iteration table above). "
+            "Include devrunner_iteration number in your analysis report for observability."
+        ),
+    )
+
+
+def _build_step_3_devrunner_analysis_actions() -> list:
+    """Build action lines for DevRunner step 4b: artifact analysis."""
+    analysis_script = get_mode_script_path("devrunner/analysis.py")
+    iter_table = _build_devrunner_iter_table()
+
+    return [
+        "  4b. DEVRUNNER ANALYSIS (for milestones with devrunner-verified flag):",
+        "     Check if test_output/brief.json and test_output/manifest.json exist.",
+        "     If both exist, proceed with analysis below. Otherwise skip 4b.",
+        "",
+        "     DEVRUNNER ITERATION TRACKING:",
+        f"     Initialize devrunner_iteration={DEVRUNNER_ITERATION_DEFAULT} at the start of",
+        "     wave execution for each milestone.",
+        "     After each analysis dispatch that returns ISSUES, increment devrunner_iteration by 1.",
+        "",
+        "     ITERATION GUARD:",
+        "     Before dispatching analysis, check devrunner_iteration.",
+        f"     If devrunner_iteration > {DEVRUNNER_ITERATION_LIMIT}, skip DevRunner analysis",
+        "     and proceed to the next wave.",
+        "",
+        "     BLOCKING SEVERITIES (pass --blocking-severities based on current iteration):",
+        iter_table,
+        "",
+        _build_analysis_dispatch(analysis_script, "cursory", "developer"),
+        "",
+        "     If cursory returns PASS:",
+        _build_analysis_dispatch(analysis_script, "thorough", "quality-reviewer"),
+        "",
+        "     If cursory returns ISSUES:",
+        "       Increment devrunner_iteration. Skip thorough dispatch.",
+        "       Report cursory findings directly.",
+        "       (Thorough analysis of already-flagged artifacts wastes invocations.)",
+    ]
+
+
+def _build_step_3_devrunner_actions() -> list:
+    """Build action lines for DevRunner brief authoring and analysis sub-steps (4a/4b)."""
+    return _build_step_3_devrunner_brief_actions() + [""] + _build_step_3_devrunner_analysis_actions()
+
+
+def _build_step_3_normal_actions() -> list:
+    """Build action lines for step 3 normal (initial) execution mode."""
+    actions = [
+        "Execute ALL milestones using wave-aware parallel dispatch.",
+        "",
+        "WAVE-AWARE EXECUTION:",
+        "  - Milestones within same wave: dispatch in PARALLEL",
+        "    (Multiple Task calls in single response)",
+        "  - Waves execute SEQUENTIALLY",
+        "    (Wait for wave N to complete before starting wave N+1)",
+        "",
+        "Use waves identified in step 1.",
+        "",
+        ORCHESTRATOR_CONSTRAINT,
+        "",
+        "FOR EACH WAVE:",
+        "  1. Dispatch developer agents for ALL milestones in wave:",
+        "     Task(developer): Milestone N",
+        "     Task(developer): Milestone M  (if parallel)",
+        "",
+        "  2. Each prompt must include:",
+        "     - Plan file: $PLAN_FILE",
+        "     - Milestone: [number and name]",
+        "     - Files: [exact paths to create/modify]",
+        "     - Acceptance criteria: [from plan]",
+        "",
+        "  3. Wait for ALL agents in wave to complete",
+        "",
+        "  4. Run tests: pytest / tsc / go test -race",
+        "     Pass criteria: 100% tests pass, zero warnings",
+        "",
+    ]
+    actions.extend(_build_step_3_devrunner_actions())
+    actions.extend([
+        "",
+        "  5. Proceed to next wave (repeat 1-4b)",
+        "",
+        "After ALL waves complete, proceed to Code QR.",
+        "",
+        "ERROR HANDLING (you NEVER fix code yourself):",
+        "  Clear problem + solution: Task(developer) immediately",
+        "  Difficult/unclear problem: Task(debugger) to diagnose first",
+        "  Uncertain how to proceed: AskUserQuestion with options",
+    ])
+    return actions
+
+
 def format_step_3_implementation(qr: QRState, total_steps: int, milestone_count: int) -> str:
     """Format step 3 implementation output."""
     if qr.state == LoopState.RETRY:
         title = "Implementation - Fix Mode"
+        actions = _build_step_3_retry_actions(qr)
     else:
         title = "Implementation"
-
-    actions = []
-    if qr.state == LoopState.RETRY:
-        actions.append(format_state_banner("IMPLEMENTATION FIX", qr.iteration, "fix"))
-        actions.append("")
-        actions.append("FIX MODE: Code QR found issues.")
-        actions.append("")
-        actions.append(ORCHESTRATOR_CONSTRAINT)
-        actions.append("")
-
-        mode_script = get_mode_script_path("dev/fix-code.py")
-        invoke_cmd = f"python3 -m {mode_script} --step 1 --qr-fail --qr-iteration {qr.iteration}"
-
-        actions.append(subagent_dispatch(
-            agent_type="developer",
-            command=invoke_cmd,
-        ))
-        actions.append("")
-        actions.append("Developer reads QR report and fixes issues in <milestone> blocks.")
-        actions.append("After developer completes, re-run Code QR for fresh verification.")
-    else:
-        actions.extend([
-            "Execute ALL milestones using wave-aware parallel dispatch.",
-            "",
-            "WAVE-AWARE EXECUTION:",
-            "  - Milestones within same wave: dispatch in PARALLEL",
-            "    (Multiple Task calls in single response)",
-            "  - Waves execute SEQUENTIALLY",
-            "    (Wait for wave N to complete before starting wave N+1)",
-            "",
-            "Use waves identified in step 1.",
-            "",
-            ORCHESTRATOR_CONSTRAINT,
-            "",
-            "FOR EACH WAVE:",
-            "  1. Dispatch developer agents for ALL milestones in wave:",
-            "     Task(developer): Milestone N",
-            "     Task(developer): Milestone M  (if parallel)",
-            "",
-            "  2. Each prompt must include:",
-            "     - Plan file: $PLAN_FILE",
-            "     - Milestone: [number and name]",
-            "     - Files: [exact paths to create/modify]",
-            "     - Acceptance criteria: [from plan]",
-            "",
-            "  3. Wait for ALL agents in wave to complete",
-            "",
-            "  4. Run tests: pytest / tsc / go test -race",
-            "     Pass criteria: 100% tests pass, zero warnings",
-            "",
-            "  5. Proceed to next wave (repeat 1-4)",
-            "",
-            "After ALL waves complete, proceed to Code QR.",
-            "",
-            "ERROR HANDLING (you NEVER fix code yourself):",
-            "  Clear problem + solution: Task(developer) immediately",
-            "  Difficult/unclear problem: Task(debugger) to diagnose first",
-            "  Uncertain how to proceed: AskUserQuestion with options",
-        ])
+        actions = _build_step_3_normal_actions()
 
     body = "\n".join(actions)
     next_cmd = f"python3 -m {MODULE_PATH} --step 4"
-
     return format_step(body, next_cmd, title=title)
 
 

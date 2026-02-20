@@ -52,7 +52,8 @@ class PlanContext:
         path = self.plan_path()
         tmp_path = path.with_suffix(".tmp")
         tmp_path.write_text(plan.model_dump_json(indent=2))
-        tmp_path.rename(path)
+        import os
+        os.replace(str(tmp_path), str(path))
         schema['validate_state'](str(self.state_dir))
 
 
