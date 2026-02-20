@@ -126,7 +126,7 @@ def init_step(title, actions):
         import json
         from pathlib import Path
 
-        state_dir = tempfile.mkdtemp(prefix="planner-")
+        state_dir = Path(tempfile.mkdtemp(prefix="planner-")).as_posix()
 
         plan_skeleton = {
             "schema_version": 2,

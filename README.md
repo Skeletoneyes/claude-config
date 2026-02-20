@@ -141,6 +141,35 @@ git fetch workflow
 git merge workflow/main --allow-unrelated-histories
 ```
 
+### Symlink Install (existing ~/.claude, no merge)
+
+If you already have a `~/.claude/` directory with credentials, history, and
+settings and prefer not to merge, you can clone the repo as a subdirectory and
+symlink the skill/config directories:
+
+```bash
+# Clone the repo inside your existing config directory
+git clone https://github.com/Skeletoneyes/claude-config ~/.claude/claude-config
+
+# Symlink the directories Claude Code looks for
+# Linux / macOS
+ln -s ~/.claude/claude-config/skills ~/.claude/skills
+ln -s ~/.claude/claude-config/agents ~/.claude/agents
+ln -s ~/.claude/claude-config/conventions ~/.claude/conventions
+ln -s ~/.claude/claude-config/output-styles ~/.claude/output-styles
+
+# Windows (run from an elevated prompt or with Developer Mode enabled)
+mklink /D "%USERPROFILE%\.claude\skills" "%USERPROFILE%\.claude\claude-config\skills"
+mklink /D "%USERPROFILE%\.claude\agents" "%USERPROFILE%\.claude\claude-config\agents"
+mklink /D "%USERPROFILE%\.claude\conventions" "%USERPROFILE%\.claude\claude-config\conventions"
+mklink /D "%USERPROFILE%\.claude\output-styles" "%USERPROFILE%\.claude\claude-config\output-styles"
+```
+
+This keeps the repo self-contained. To update, just `git pull` inside
+`~/.claude/claude-config/` and the symlinks pick up changes automatically.
+Your existing `~/.claude/` files (credentials, history, settings) remain
+untouched.
+
 ## Usage
 
 The workflow for non-trivial changes: explore -> plan -> execute.
@@ -384,3 +413,81 @@ For targeted updates:
 ```
 Use your doc-sync skill to update documentation in src/validators/
 ```
+
+## Beads Integration
+
+This workflow includes optional integration with beads (bd), a git-backed issue tracker for persistent cross-session work tracking.
+
+### Why Beads?
+
+LLM conversations get cleared. Context resets. TodoWrite tasks vanish when you `/clear`. Beads solves this by providing issue tracking that survives across sessions.
+
+Without beads, planning a feature in one session and executing it after `/clear` means reconstructing all context from the plan file. With beads:
+
+- Feature and milestone issues persist across sessions
+- Dependencies between milestones are explicit
+- Progress tracking survives conversation resets
+- Technical debt from analysis can be queued for later
+
+### How It Works
+
+Beads is **optional and per-project**. Skills detect whether beads is initialized in the current working directory and gracefully fall back to TodoWrite when unavailable.
+
+```bash
+# Initialize in your project (not in the config directory)
+cd ~/projects/my-app
+bd init --prefix APP  # Creates .beads/ with APP-001, APP-002, etc.
+```
+
+The planner skill uses beads automatically when available:
+
+- **Planning phase**: Suggests creating a feature issue and milestone issues with dependencies
+- **Execution phase**: Tracks milestone status (in_progress → closed)
+- **Retrospective**: Shows remaining work via `bd ready`
+
+### Beads vs TodoWrite
+
+| Aspect | Beads | TodoWrite |
+|--------|-------|-----------|
+| Lifetime | Persistent across sessions | Single conversation |
+| Survives /clear | ✅ Yes | ❌ No |
+| Git-backed | ✅ Yes | ❌ No |
+| Dependencies | ✅ Yes | ❌ No |
+| Use case | Cross-session tracking | In-session tasks |
+
+**Hybrid strategy recommended:**
+
+- **Beads**: Feature planning, milestone tracking, technical debt, architecture gaps
+- **TodoWrite**: Debug cleanup, QR fix iterations, current wave tracking, sub-task breakdown
+
+### Common Commands
+
+```bash
+# Create issues
+bd create --type feature --title "Add async logging" --priority 1
+bd create --type task --title "M0: Configure NLog" --deps APP-001
+
+# Update status
+bd update APP-002 --status in_progress
+bd close APP-002 "Milestone complete"
+
+# Check work
+bd ready                  # Show tasks with no blockers
+bd list --status open     # Show all open issues
+bd blocked                # Show blocked issues
+
+# Dependencies
+bd dep APP-003 APP-002    # APP-003 depends on APP-002
+```
+
+### Graceful Degradation
+
+All beads integration is optional. Skills work identically when beads is not available. No error messages if unavailable. Skills suggest but don't require beads usage.
+
+This allows the workflow to work across:
+- Projects with beads initialized
+- Projects using external issue tracking (JIRA, GitHub Issues)
+- Projects with no issue tracking
+- Quick one-off tasks
+
+For full details, see conventions/beads-integration.md

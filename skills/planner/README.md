@@ -63,6 +63,8 @@ After planning completes and context clears (`/clear`), execution proceeds:
 | Documentation          | Technical writer updates CLAUDE.md/README.md                    |
 | Retrospective          | Present execution summary                                       |
 
+**Important**: When invoking the executor, use only `--step N` without `--state-dir`. The executor auto-discovers state from the planner session. See SKILL.md for details.
+
 I designed the coordinator to never write code directly -- it delegates to
 developers. Separating coordination from implementation produces cleaner
 results. The coordinator:
