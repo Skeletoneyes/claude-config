@@ -260,8 +260,12 @@ def format_gate(step: int, gate: GateConfig, qr: QRState, total_steps: int) -> s
 
 
 def _build_step_3_retry_actions(qr: QRState) -> list:
-    """Build action lines for step 3 fix mode (Code QR found issues)."""
-    mode_script = get_mode_script_path("dev/fix-code.py")
+    """Build action lines for step 3 fix mode (Code QR found issues).
+
+    Dispatches developer agent to exec_implement_qr_fix module for
+    post-Code-QR repair workflow.
+    """
+    mode_script = get_mode_script_path("developer/exec_implement_qr_fix.py")
     invoke_cmd = f"python3 -m {mode_script} --step 1 --qr-fail --qr-iteration {qr.iteration}"
     actions = [
         format_state_banner("IMPLEMENTATION FIX", qr.iteration, "fix"),

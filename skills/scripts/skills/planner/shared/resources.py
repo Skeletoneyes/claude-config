@@ -6,6 +6,7 @@ Handles loading of resource files and path resolution.
 from pathlib import Path
 
 import json
+import importlib.util
 
 from skills.lib.io import read_text_or_exit
 
@@ -147,18 +148,29 @@ def get_resource(name: str) -> str:
 def get_mode_script_path(script_name: str) -> str:
     """Get module path for -m invocation.
 
-    Mode scripts provide step-based workflows for sub-agents.
-    Scripts are organized by agent: qr/, dev/, tw/
+    Mode scripts provide step-based workflows for sub-agents. Validates
+    that the computed module path resolves to an importable Python module
+    before returning it. (ref: DL-002)
 
     Args:
         script_name: Script path relative to planner/ (e.g., "qr/plan-docs.py")
 
     Returns:
         Module path for python3 -m (e.g., "skills.planner.qr.plan_docs")
+
+    Raises:
+        ValueError: If computed module path does not resolve to an importable module
     """
     # Convert path to module: "qr/plan-docs.py" -> "qr.plan_docs"
     module = script_name.replace("/", ".").replace("-", "_").removesuffix(".py")
-    return f"skills.planner.{module}"
+    full_module = f"skills.planner.{module}"
+    # Validate module exists at prompt-generation time (DL-002, DL-004)
+    if importlib.util.find_spec(full_module) is None:
+        raise ValueError(
+            f"Module not found: {full_module} (from script_name=\"{script_name}\"). "
+            f"Check WORK_PHASES in routing.py for valid module paths."
+        )
+    return full_module
 
 
 def get_exhaustiveness_prompt() -> list[str]:
